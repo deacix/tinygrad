@@ -12,10 +12,20 @@ is needed. `AGENTS.md` is the small routing index. Load only the relevant skill.
 | [property-based-testing](property-based-testing/SKILL.md) | Trail of Bits, pinned below | Existing Hypothesis tests cover dtype and graph edge cases. Oracle selection, shrinking and test review complement example tests. Read [local caveats](property-based-testing/NOTICE.md) first. |
 | [tinygrad-rewrite-debugging](tinygrad-rewrite-debugging/SKILL.md) | First-party, MIT | Connects UOps, named passes, SPEC, structural tests and numerical regressions. Includes an isolated VIZ capture and NULL-backend limitations. |
 | [tinygrad-performance-triage](tinygrad-performance-triage/SKILL.md) | First-party, MIT | Separates compilation, dispatch, scheduler and kernel costs; bounds workloads and avoids false speedups from JIT warmup, async execution or instrumentation. |
+| [tinygrad-llm-engine-development](tinygrad-llm-engine-development/SKILL.md) | First-party, MIT | Engine-specific cache/state, attention/MoE, GGUF and protocol invariants; five on-demand references and bounded synthetic checks. Reuses the three skills above. |
 
-The two first-party skills are original repository-specific workflows, not
+The first-party skills are original repository-specific workflows, not
 renamed marketplace installs. No suitable off-the-shelf tinygrad-specific skill
-was verified in this research. Their source of truth is this
+was verified in this research. The LLM skill was reviewed separately against
+`644c5863112f1c9049aca097bc30c7415ae72580`; its
+[provenance and evidence](tinygrad-llm-engine-development/references/sources.md)
+records primary model/format/protocol sources and the inspected, rejected vLLM
+prefix-cache skill. No third-party material was imported for that skill. Its
+[safe validation guide](tinygrad-llm-engine-development/references/validation.md)
+separates small numerical/model-state tests, synthetic GGUF, loopback HTTP and
+hardware-only checks. It adds no application behavior or dependencies.
+
+The rewrite and performance skills' source of truth is this
 [reviewed tinygrad tree](https://github.com/deacix/tinygrad/tree/289656f6e88e94ecce8dfb1dcf5378fccf577d0d),
 especially [VIZ](https://github.com/deacix/tinygrad/blob/289656f6e88e94ecce8dfb1dcf5378fccf577d0d/tinygrad/viz/README.md)
 and [speed categories](https://github.com/deacix/tinygrad/blob/289656f6e88e94ecce8dfb1dcf5378fccf577d0d/docs/developer/speed.md).
@@ -107,7 +117,7 @@ permissions or plugins:
 opencode debug skill
 ```
 
-Expect the three names above, with locations under this checkout and non-empty
+Expect the four names above, with locations under this checkout and non-empty
 instruction content. Run inside the worktree. Its `skill` tool loads these names
 on demand; no model/provider is required for `debug skill`. If missing, check
 capitalization, directory/name agreement and user/global permission overrides.
@@ -120,11 +130,12 @@ in a disposable Python 3.11+ venv, **not tinygrad's dependencies**. After review
 that source, install its `skills-ref` directory into that venv and run:
 
 ```sh
-for name in property-based-testing tinygrad-rewrite-debugging tinygrad-performance-triage; do
+for name in property-based-testing tinygrad-rewrite-debugging tinygrad-performance-triage tinygrad-llm-engine-development; do
   skills-ref validate ".agents/skills/$name" || exit 1
 done
 skills-ref to-prompt .agents/skills/property-based-testing \
-  .agents/skills/tinygrad-rewrite-debugging .agents/skills/tinygrad-performance-triage
+  .agents/skills/tinygrad-rewrite-debugging .agents/skills/tinygrad-performance-triage \
+  .agents/skills/tinygrad-llm-engine-development
 ```
 
 The reference library needs Click and StrictYAML. This validates metadata and
@@ -155,5 +166,11 @@ skill contains a conditional CPU GEMM smoke. Respect test modules' imports:
 compile on CPU. Do not replace numerical checks with NULL passes. Full backend,
 GPU, SQTT, process-replay and throughput claims need their own infrastructure.
 
-Removal is simply deleting these three skill directories and their AGENTS.md
-links; there are no installed hooks, global config or services to undo.
+The LLM skill's validation guide adds explicit Python 3.12+ numerical selections
+(half support), synthetic GGUF fixtures and mock loopback OpenAI-client tests.
+Do not run the whole GGUF or tokenizer file as an offline smoke: both contain
+fetch-capable tests. Hardware-only RDNA3 kernels and real-model checks remain a
+separate opt-in tier; CPU/Python and skipped tests do not validate them.
+
+Removal is simply deleting the selected skill directories and their AGENTS.md
+links/README entries; there are no installed hooks, global config or services to undo.

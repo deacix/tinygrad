@@ -13,5 +13,6 @@ Load only the skill matching the task; these supplement the notes above.
 - [property-based-testing](.agents/skills/property-based-testing/SKILL.md): write, review or shrink Hypothesis properties. Read its [tinygrad caveats](.agents/skills/property-based-testing/NOTICE.md) first, especially floating-point semantics and test bounds.
 - [tinygrad-rewrite-debugging](.agents/skills/tinygrad-rewrite-debugging/SKILL.md): localize UOp, symbolic, scheduling and codegen regressions with SPEC and VIZ.
 - [tinygrad-performance-triage](.agents/skills/tinygrad-performance-triage/SKILL.md): separate compile, dispatch, scheduler and kernel costs before optimizing.
+- [tinygrad-llm-engine-development](.agents/skills/tinygrad-llm-engine-development/SKILL.md): develop LLM prefill/decode and cache semantics, attention/MoE, GGUF loading, tokenization and serving compatibility with bounded synthetic tests.
 
 See [.agents/skills/README.md](.agents/skills/README.md) for sources, installation, verification and exclusions.
