@@ -1,6 +1,7 @@
 import unittest
+from typing import Any
 import numpy as np
-from tinygrad import Tensor, dtypes, nn
+from tinygrad import Tensor, UOp, dtypes, nn
 from tinygrad.llm.model import (
   GatedDeltaNetBlock, SSMConfig, Transformer, TransformerBlock, TransformerConfig,
   apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk,
@@ -85,16 +86,18 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     np.testing.assert_allclose(out.numpy(), expected_out, rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(state.numpy(), expected_state, rtol=1e-4, atol=1e-4)
 
-  def _tensor_linspace(self, start:float, stop:float, shape:tuple[int, ...]) -> Tensor:
-    return Tensor.linspace(start, stop, int(np.prod(shape)), dtype=dtypes.float32).reshape(*shape)
+  def _tensor_linspace(self, start:float, stop:float, shape:tuple[int|UOp, ...]) -> Tensor:
+    return Tensor.linspace(start, stop, int(np.prod(tuple(int(s) for s in shape))), dtype=dtypes.float32).reshape(*shape)
 
   def _make_config(self, **kwargs):
-    return TransformerConfig(**({"num_blocks":1, "dim":8, "hidden_dim":16, "n_heads":1, "n_kv_heads":1,
-                                 "norm_eps":1e-5, "vocab_size":32, "head_dim":8, "rope_theta":10000.0,
-                                 "rope_dim":8, "v_head_dim":8, "max_context":4, "ssm_layers":(True,),
-                                 "ssm":SSMConfig(conv_kernel=2, state_size=4, group_count=1, time_step_rank=1, inner_size=4)} | kwargs))
+    config:dict[str, Any] = {"num_blocks":1, "dim":8, "hidden_dim":16, "n_heads":1, "n_kv_heads":1,
+                            "norm_eps":1e-5, "vocab_size":32, "head_dim":8, "rope_theta":10000.0,
+                            "rope_dim":8, "v_head_dim":8, "max_context":4, "ssm_layers":(True,),
+                            "ssm":SSMConfig(conv_kernel=2, state_size=4, group_count=1, time_step_rank=1, inner_size=4)}
+    return TransformerConfig(**(config | kwargs))
 
   def _make_block(self, config:TransformerConfig) -> GatedDeltaNetBlock:
+    assert config.ssm is not None
     block = GatedDeltaNetBlock(config, config.ssm)
     block.attn_norm.weight = self._tensor_linspace(0.8, 1.2, (config.dim,))
     block.attn_qkv.weight = self._tensor_linspace(-0.15, 0.2, (block.conv_channels, config.dim))
@@ -151,18 +154,20 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     out_weight = block.ssm_out.weight.numpy().astype(np.float32)
     dt_bias = block.ssm_dt["bias"].numpy().astype(np.float32)
     ssm_a = block.ssm_a.numpy().astype(np.float32)
+    assert block.attn_norm.weight is not None and block.ssm_norm.weight is not None
     attn_norm_weight = block.attn_norm.weight.numpy().astype(np.float32)
     ssm_norm_weight = block.ssm_norm.weight.numpy().astype(np.float32)
     outputs, conv_states, recurrent_states = [], [], []
 
     for t in range(T):
       x_norm = self._rms_norm_np(x_np[:, t:t+1, :], attn_norm_weight, block.attn_norm.eps)
-      x_half = x_norm.astype(np.float16)
-      out_gate = self._linear_np(x_half, gate_weight).reshape(B, 1, block.num_v_heads, block.head_v_dim)
-      beta = 1.0 / (1.0 + np.exp(-self._linear_np(x_half, beta_weight))).reshape(B, block.num_v_heads, 1, 1)
-      alpha = np.exp((self._softplus_np(self._linear_np(x_half, alpha_weight) + dt_bias)).reshape(B, block.num_v_heads, 1, 1) *
+      # These test weights are FP32: codegen's pm_simplify_add_image removes the fused half->float input roundtrip.
+      # The materialized half output below survives. The Qwen fixtures separately retain the nominal cast-only oracle.
+      out_gate = self._linear_np(x_norm, gate_weight).reshape(B, 1, block.num_v_heads, block.head_v_dim)
+      beta = 1.0 / (1.0 + np.exp(-self._linear_np(x_norm, beta_weight))).reshape(B, block.num_v_heads, 1, 1)
+      alpha = np.exp((self._softplus_np(self._linear_np(x_norm, alpha_weight) + dt_bias)).reshape(B, block.num_v_heads, 1, 1) *
                      ssm_a.reshape(1, block.num_v_heads, 1, 1))
-      conv_window = np.concatenate([conv_state, self._linear_np(x_half, qkv_weight)], axis=1)
+      conv_window = np.concatenate([conv_state, self._linear_np(x_norm, qkv_weight)], axis=1)
       conv_out = self._silu_np((conv_window * conv_weight).sum(axis=1))
       q, k, v = np.split(conv_out, [block.q_dim, 2 * block.q_dim], axis=-1)
       q = self._normalize_np(q.reshape(B, block.num_k_heads, block.head_k_dim))
@@ -245,6 +250,22 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
                                  err_msg=f"GatedDeltaNet reset conv cache mismatch at step {step}")
       np.testing.assert_allclose(recurrent_state, expected_recurrent[step], rtol=1e-3, atol=1e-3,
                                  err_msg=f"GatedDeltaNet reset recurrent cache mismatch at step {step}")
+
+  def test_kda_low_norm_keeps_clamp_normalization(self):
+    config = self._make_config(dim=4, hidden_dim=8,
+      ssm=SSMConfig(conv_kernel=2, state_size=2, group_count=1, time_step_rank=1, inner_size=2, kda=True))
+    block = GatedDeltaNetBlock(config, config.ssm)
+    qkv = np.array([1e-8, -3e-8, 2e-8, 4e-8, 0.2, -0.3], dtype=np.float32)
+    block.attn_qkv.weight = Tensor(qkv[:, None] * np.array([[1, 0, 0, 0]], dtype=np.float32))
+    block.ssm_conv1d["weight"] = Tensor(np.tile(np.array([0, 1], dtype=np.float32), (6, 1)))
+    block.ssm_beta.weight = Tensor.zeros(1, config.dim)
+    x = Tensor([[[1., 0., 0., 0.]]])
+    block._init_state(x)
+    block._attention(x, 0).realize()
+    conv = self._silu_np(qkv)
+    key = conv[2:4] / max(np.linalg.norm(conv[2:4]), 1e-12)
+    expected = 0.5 * conv[4:, None] * key[None, :]
+    np.testing.assert_allclose(block.recurrent_state.numpy()[0, 0], expected, rtol=1e-5, atol=1e-6)
 
   def test_kda_channel_decay(self):
     config = self._make_config(dim=4, hidden_dim=8, n_heads=2, head_dim=4, rope_dim=4, v_head_dim=4,
