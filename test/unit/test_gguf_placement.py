@@ -148,7 +148,7 @@ class TestGGUFIndex:
 
   @pytest.mark.parametrize('key,typ,value', [('split.no',2,0), ('split.count',2,3), ('split.tensors.count',10,3),
     ('general.architecture',8,'qwen2'), ('llama.block_count',4,3), ('tokenizer.ggml.model',8,'other'),
-    ('llama.context_length',4,4096)])
+    ('llama.context_length',4,4096), ('general.quantization_version',4,999), ('general.tensor_data_layout',8,'other')])
   def test_split_conflicts(self, tmp_path, key, typ, value):
     a,b = self._parts(tmp_path)
     metadata = {'split.no':(2,1), 'split.count':(2,2), 'split.tensors.count':(10,2),

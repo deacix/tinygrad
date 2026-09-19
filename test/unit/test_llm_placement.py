@@ -401,6 +401,16 @@ class TestPlacedLoading:
       assert model.output.weight.device == 'CPU:1' and model.token_embd.weight.device == 'CPU'
       np.testing.assert_array_equal(model.blk[3].ffn_down.weight.numpy(),values['blk.3.ffn_down.weight'])
 
+  @pytest.mark.parametrize('key,typ,value', [('general.quantization_version',4,999),('general.tensor_data_layout',8,'other')])
+  def test_later_shard_layout_metadata_rejected_before_allocations(self, tmp_path, key, typ, value):
+    ts, kv, _ = llama_fixture()
+    paths = [tmp_path/f'model-{i:05d}-of-00002.gguf' for i in (1,2)]
+    split = len(ts)//2
+    for i,(path,part) in enumerate(zip(paths,(ts[:split],ts[split:]))):
+      path.write_bytes(build_gguf(part,{**(kv if i == 0 else {key:(typ,value)}), 'split.no':(2,i),'split.count':(2,2)}))
+    with no_allocations(), pytest.raises(ValueError,match='Later-only GGUF'):
+      Transformer.from_gguf(paths[0],placement=LayerPlacement(('CPU','CPU:1'),(1,3)))
+
   def test_midload_failure_discards_partial_model(self, tmp_path):
     import pathlib
     path, _ = save_llama(tmp_path)

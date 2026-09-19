@@ -400,7 +400,7 @@ def index_gguf(path: str | pathlib.Path) -> GGUFIndex:
       if key.startswith('split.'): continue
       if key in kv:
         if type(value) is not type(kv[key]) or value != kv[key]: raise ValueError(f'Conflicting GGUF split metadata: {key}')
-      elif key == 'general.architecture' or not key.startswith('general.'):
+      elif key in ('general.architecture', 'general.quantization_version', 'general.tensor_data_layout') or not key.startswith('general.'):
         raise ValueError(f'Later-only GGUF configuration/tokenizer metadata: {key}')
     if names.intersection(t.name for t in infos): raise ValueError('Duplicate GGUF tensor across parts')
     names.update(t.name for t in infos)
