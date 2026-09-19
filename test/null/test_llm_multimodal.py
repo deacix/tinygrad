@@ -21,7 +21,7 @@ class TestQwenFixtureContracts(unittest.TestCase):
     self.assertEqual(m["backend"]["attention"], "eager")
     self.assertFalse(m["backend"]["optional_kernels"])
     self.assertEqual(set(m["parity_tiers"]), {"hf_fp32_algebra", "native_cast", "amd_quantized"})
-    self.assertEqual(m["parity_tiers"]["native_cast"]["status"], "deferred_A2")
+    self.assertEqual(m["parity_tiers"]["native_cast"]["status"], "captured")
     self.assertEqual(m["parity_tiers"]["amd_quantized"]["status"], "deferred_E")
     self.assertEqual(m["seed"], 20260919)
     self.assertEqual(m["parity_tiers"]["hf_fp32_algebra"]["tolerance"], {"rtol": 1e-4, "atol": 1e-5})
