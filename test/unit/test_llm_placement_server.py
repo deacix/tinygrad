@@ -1,10 +1,16 @@
 """Offline placement CLI/HTTP acceptance: mandatory CPU, local synthetic GGUF only."""
-import subprocess, sys, textwrap
+import http.client, json, socket, subprocess, sys, textwrap, threading
+from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import pytest
 from tinygrad.llm import cli
 from tinygrad.llm.placement import LayerPlacement
 from test.unit.test_llm_placement import save_llama
+from test.unit.test_llm_placement_execution import load_pair, ref_step
+from tinygrad.llm import model as mm
+from tinygrad.llm.model import PlacedInferenceError, PlacedModelUnavailableError, PlacedModelBusyError
+from tinygrad.llm.serve import LLMServer, Handler
 
 
 def placement_args(path):
@@ -195,3 +201,339 @@ class TestPlacementCLI:
     with patch('builtins.input',return_value='hello'), pytest.raises(type(error)):
       run_cli(placement_args(path),Mock(generate=Mock(return_value=gen)))
     assert gen.closed
+
+
+@contextmanager
+def running_server(model, *, tok=None, **kwargs):
+  server = LLMServer(('127.0.0.1',0),model,'offline',tok or tokenizer(),Mock(render=Mock(return_value='private prompt')),**kwargs)
+  thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval':0.01})
+  thread.start()
+  try: yield server
+  finally:
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
+def request(server, **options):
+  conn = http.client.HTTPConnection(*server.server_address,timeout=30)
+  try:
+    body = {'model':'offline','messages':[{'role':'user','content':'private prompt'}]} | options
+    conn.request('POST','/v1/chat/completions',body=json.dumps(body),headers={'Content-Type':'application/json'})
+    response = conn.getresponse()
+    return response.status, response.getheader('Content-Type'), response.read()
+  finally: conn.close()
+
+
+def events(payload):
+  return [json.loads(line[6:]) for line in payload.splitlines() if line.startswith(b'data: ') and line != b'data: [DONE]']
+
+
+class PlacedStub:
+  # An explicit LayerPlacement is essential: Mock's dynamic attributes must not enable the placed path.
+  placement = LayerPlacement(('CPU','CPU:1'),(1,3),chunk_size=4)
+  max_context = 32
+  def __init__(self, tokens=(2,3,999), fail_after=None):
+    self.tokens, self.fail_after = tokens, fail_after
+    self.state, self.closed, self.calls, self.checks = 'ready', [], [], 0
+  def check_available(self):
+    self.checks += 1
+    if self.state == 'failed': raise PlacedModelUnavailableError('backend private data')
+    if self.state != 'ready': raise PlacedModelBusyError('backend private data')
+  def get_start_pos(self,ids): return 0
+  def generate(self,ids,**kwargs):
+    self.check_available()
+    self.state = 'generating'
+    self.calls.append((list(ids),kwargs))
+    try:
+      for i,tid in enumerate(self.tokens):
+        if i == self.fail_after:
+          self.state = 'failed'
+          raise PlacedInferenceError(1,'CPU:1','stage') from RuntimeError('backend private data')
+        yield tid
+    finally:
+      self.closed.append(True)
+      if self.state != 'failed': self.state = 'ready'
+
+
+class TestPlacementHTTP:
+  def test_rejects_placed_vision_before_socket_open_and_preserves_dynamic_mocks(self):
+    with patch.object(socket.socket,'bind',side_effect=AssertionError('socket opened')), pytest.raises(ValueError,match='placement.*vision'):
+      LLMServer(('127.0.0.1',0),PlacedStub(),'offline',tokenizer(),Mock(),vision=object())
+    with running_server(Mock(max_context=32),vision=object()): pass
+
+  @pytest.mark.parametrize('stream', [False,True])
+  @pytest.mark.parametrize('state,status', [('failed',503),('generating',409)])
+  def test_availability_checked_before_headers(self,stream,state,status):
+    model = PlacedStub()
+    model.state = state
+    with running_server(model) as server: code, content_type, body = request(server,stream=stream)
+    assert code == status and content_type == 'application/json'
+    assert json.loads(body)['error']['type'] == 'server_error'
+    assert b'backend private data' not in body and b'[DONE]' not in body
+    assert model.checks == 1 and model.calls == [] and model.closed == []
+
+  @pytest.mark.parametrize('stream', [False,True])
+  @pytest.mark.parametrize('fail_after', [0,1])
+  def test_execution_failure_is_sanitized_nonstream_500_or_stream_abort(self,stream,fail_after):
+    model = PlacedStub(fail_after=fail_after)
+    with patch('tinygrad.llm.serve.stderr_log') as log, running_server(model) as server:
+      status, content_type, body = request(server,stream=stream)
+      retry, _, retry_body = request(server,stream=True)
+    assert retry == 503 and b'[DONE]' not in retry_body
+    assert model.closed == [True] and model.state == 'failed'
+    if stream:
+      assert status == 200 and content_type == 'text/event-stream'
+      assert b'[DONE]' not in body and b'"server_error"' not in body
+      assert all(c['choices'][0]['finish_reason'] is None for c in events(body))
+      assert len(events(body)) == 1+fail_after
+    else:
+      assert status == 500 and json.loads(body)['error']['type'] == 'server_error'
+    logs = ''.join(c.args[0] for c in log.call_args_list)
+    assert 'stage=1' in logs and 'device=CPU:1' in logs and 'operation=stage' in logs and 'PlacedInferenceError' in logs
+    assert 'backend private data' not in logs and 'private prompt' not in logs
+    assert b'backend private data' not in body and b'private prompt' not in body
+
+  @pytest.mark.parametrize('stream', [False,True])
+  @pytest.mark.parametrize('limit,finish,count', [(None,'stop',2),(1,'length',1)])
+  def test_eos_limits_usage_temperature_and_close(self,stream,limit,finish,count):
+    model = PlacedStub()
+    with running_server(model) as server:
+      status, _, body = request(server,stream=stream,max_completion_tokens=None,max_tokens=limit,
+                                temperature=0.7,stream_options={'include_usage':True})
+    assert status == 200 and model.closed == [True] and model.state == 'ready'
+    assert model.checks == 2 and model.calls == [([1,2],{'temperature':0.7})]
+    if stream:
+      chunks = events(body)
+      assert b'[DONE]' in body and chunks[0]['choices'][0]['delta']['role'] == 'assistant'
+      usage, choice = chunks[-1]['usage'], chunks[-2]['choices'][0]
+    else:
+      obj = json.loads(body)
+      usage, choice = obj['usage'], obj['choices'][0]
+    assert choice['finish_reason'] == finish
+    assert usage == {'prompt_tokens':2,'completion_tokens':count,'total_tokens':2+count}
+
+  @pytest.mark.parametrize('stream', [False,True])
+  def test_iterators_without_close_and_operator_cap(self,stream):
+    model = PlacedStub()
+    model.generate = Mock(side_effect=lambda *a,**kw: iter((2,3,999)))
+    with running_server(model,max_output_tokens=1) as server:
+      status, _, body = request(server,stream=stream,max_tokens=9)
+    assert status == 200
+    if stream:
+      assert b'[DONE]' in body
+      assert events(body)[-1]['choices'][0]['finish_reason'] == 'length'
+    else: assert json.loads(body)['usage']['completion_tokens'] == 1
+
+  def test_run_model_closes_before_final_chunk_and_preserves_later_owner(self):
+    model = PlacedStub()
+    handler = SimpleNamespace(server=SimpleNamespace(model=model,tok=tokenizer()))
+    first = Handler.run_model(handler,[1,2],'offline',max_tokens=1)
+    next(first)  # role
+    next(first)  # content
+    assert model.state == 'generating'
+    assert next(first)['choices'][0]['finish_reason'] == 'length'
+    assert model.closed == [True] and model.state == 'ready'
+    second = Handler.run_model(handler,[1,3],'offline',max_tokens=1)
+    try:
+      next(second)
+      next(second)
+      first.close()
+      assert model.state == 'generating'
+    finally:
+      first.close()
+      second.close()
+    assert model.state == 'ready' and model.closed == [True,True]
+
+  def test_failure_log_rejects_untrusted_metadata(self):
+    from tinygrad.llm.serve import log_placed_failure
+    with patch('tinygrad.llm.serve.stderr_log') as log:
+      log_placed_failure(PlacedInferenceError('private prompt','CPU:1\nbackend private data','stage\nprivate prompt'))
+    assert log.call_args.args[0] == ('placed inference failure: stage=unknown device=unknown operation=unknown '
+                                    'exception=PlacedInferenceError; reload required\n')
+
+  def test_two_requests_are_serialized_until_first_generator_closes(self):
+    model = PlacedStub()
+    entered, release, second_sent = threading.Event(), threading.Event(), threading.Event()
+    order, results, errors = [], [], []
+    def generate(ids, **kwargs):
+      number = len(model.calls)+1
+      model.check_available()
+      model.state = 'generating'
+      model.calls.append(number)
+      order.append(('start',number))
+      try:
+        if number == 1:
+          entered.set()
+          assert release.wait(5)
+        yield 2
+      finally:
+        model.state = 'ready'
+        order.append(('close',number))
+    model.generate = generate
+    with running_server(model) as server:
+      def client(number):
+        conn = http.client.HTTPConnection(*server.server_address,timeout=10)
+        try:
+          body = {'model':'offline','messages':[{'role':'user','content':str(number)}],'max_tokens':1}
+          conn.request('POST','/v1/chat/completions',body=json.dumps(body))
+          if number == 2: second_sent.set()
+          response = conn.getresponse()
+          results.append((number,response.status,response.read()))
+        except Exception as exc: errors.append(exc)
+        finally: conn.close()
+      first, second = (threading.Thread(target=client,args=(i,)) for i in (1,2))
+      first.start()
+      try:
+        assert entered.wait(5)
+        second.start()
+        assert second_sent.wait(5)
+        assert order == [('start',1)]
+      finally:
+        release.set()
+        first.join(timeout=10)
+        if second.ident is not None: second.join(timeout=10)
+        assert not first.is_alive() and not second.is_alive()
+    assert not errors and len(results) == 2 and all(status == 200 for _,status,_ in results)
+    assert order == [('start',1),('close',1),('start',2),('close',2)]
+
+  def test_loopback_disconnect_closes_generation_and_allows_next_request(self):
+    import struct
+    model = PlacedStub()
+    resumed, closed = threading.Event(), threading.Event()
+    original = model.generate
+    def generate(ids, **kwargs):
+      try:
+        gen = original(ids,**kwargs)
+        try:
+          yield next(gen)
+          assert resumed.wait(5)
+          yield from gen
+        finally: gen.close()
+      finally: closed.set()
+    model.generate = generate
+    with running_server(model) as server:
+      conn = socket.create_connection(server.server_address,timeout=5)
+      try:
+        body = json.dumps({'model':'offline','messages':[{'role':'user','content':'hello'}],'stream':True}).encode()
+        conn.sendall(f'POST /v1/chat/completions HTTP/1.0\r\nContent-Length: {len(body)}\r\n\r\n'.encode()+body)
+        received = b''
+        while b'"content": "2 "' not in received:
+          part = conn.recv(65536)
+          assert part
+          received += part
+        conn.setsockopt(socket.SOL_SOCKET,socket.SO_LINGER,struct.pack('ii',1,0))
+      finally:
+        conn.close()
+        resumed.set()
+      assert closed.wait(5)
+      assert model.state == 'ready' and model.closed == [True]
+      status, _, _ = request(server,max_tokens=1)
+      assert status == 200 and model.closed == [True,True]
+
+  @pytest.mark.parametrize('stream', [False,True])
+  def test_unrelated_errors_are_not_converted_to_placed_execution_errors(self,stream):
+    model = PlacedStub()
+    model.generate = Mock(side_effect=ValueError('programmer bug'))
+    handler = object.__new__(Handler)
+    handler.server = SimpleNamespace(model=model,vision=None,template=Mock(render=Mock(return_value='hello')),
+                                     tok=tokenizer(),max_output_tokens=None)
+    handler.path = '/v1/chat/completions'
+    handler.read_chat_request = lambda: {'model':'offline','messages':[],'stream':stream}
+    handler.send_data = Mock()
+    handler.send_response, handler.send_header, handler.end_headers, handler.wfile = Mock(), Mock(), Mock(), Mock()
+    with pytest.raises(ValueError,match='programmer bug'): handler.do_POST()
+    handler.send_data.assert_not_called()
+    assert not any(b'[DONE]' in c.args[0] for c in handler.wfile.write.call_args_list)
+
+
+class TestPlacementHTTPRealCPU:
+  def test_actual_placement_vision_rejected_before_binding_socket(self,tmp_path):
+    model, _ = load_pair(tmp_path)
+    with patch.object(socket.socket,'bind',side_effect=AssertionError('socket opened')), pytest.raises(ValueError,match='placement.*vision'):
+      LLMServer(('127.0.0.1',0),model,'offline',tokenizer(),Mock(),vision=object())
+    model.check_available()
+
+  def test_busy_real_generator_returns_409_without_releasing_owner(self,tmp_path):
+    model, _ = load_pair(tmp_path)
+    gen = model.generate([1,2])
+    try:
+      next(gen)
+      with running_server(model) as server:
+        status, content_type, body = request(server,stream=True)
+      assert status == 409 and content_type == 'application/json' and b'[DONE]' not in body
+      assert model._placed.state == 'generating' and model._placed.lock.locked()
+      next(gen)
+    finally: gen.close()
+    model.check_available()
+
+  @pytest.mark.parametrize('mode', ['host','native'])
+  def test_stream_nonstream_and_independent_cpu_reference_parity(self,tmp_path,mode):
+    model, ref = load_pair(tmp_path,mode=mode)
+    # Two greedy IDs computed independently, including the teacher-forced second step.
+    first = int(ref_step(ref,[1,2],0).argmax())
+    second = int(ref_step(ref,[first],2).argmax())
+    with running_server(model) as server:
+      status, _, body = request(server,max_tokens=2)
+      assert status == 200
+      result = json.loads(body)
+      model.check_available()
+      status, _, body = request(server,stream=True,max_tokens=2,stream_options={'include_usage':True})
+      assert status == 200 and body.endswith(b'data: [DONE]\n\n')
+      chunks = events(body)
+      model.check_available()
+    assert result['choices'][0]['message']['content'] == f'{first} {second} '
+    assert ''.join(c['choices'][0]['delta'].get('content','') for c in chunks if c['choices']) == f'{first} {second} '
+    assert result['usage'] == chunks[-1]['usage'] == {'prompt_tokens':2,'completion_tokens':2,'total_tokens':4}
+    assert result['choices'][0]['finish_reason'] == chunks[-2]['choices'][0]['finish_reason'] == 'length'
+    assert model._cached_tokens == [1,2,first]
+
+  @pytest.mark.parametrize('stream,fail_at', [(False,1),(True,2)])
+  @pytest.mark.parametrize('backend_error', [RuntimeError,BrokenPipeError,ConnectionResetError])
+  def test_fault_after_real_kv_mutation_fails_closed(self,tmp_path,stream,fail_at,backend_error):
+    model, _ = load_pair(tmp_path)
+    transfer = mm._transfer_activation
+    calls = []
+    def fail(x,destination,mode):
+      calls.append(True)
+      if len(calls) == fail_at:
+        # Stage zero has already synchronously written actual owner-local KV.
+        valid = 2 if fail_at == 1 else 3
+        assert (model.blk[0].cache_kv.numpy()[:,:,:,:valid,:] != 0).any()
+        raise backend_error('backend private data with private prompt')
+      return transfer(x,destination,mode)
+    with patch.object(mm,'_transfer_activation',fail), patch('tinygrad.llm.serve.stderr_log') as log, running_server(model) as server:
+      status, _, body = request(server,stream=stream,max_tokens=3)
+      retry, content_type, retry_body = request(server,stream=True)
+    assert retry == 503 and content_type == 'application/json' and b'[DONE]' not in retry_body
+    assert model._cached_tokens == [] and model._placed.state == 'failed' and not model._placed.lock.locked()
+    if stream:
+      assert status == 200 and len(events(body)) == 2
+      assert b'[DONE]' not in body and b'"server_error"' not in body
+      assert all(c['choices'][0]['finish_reason'] is None for c in events(body))
+    else: assert status == 500 and json.loads(body)['error']['type'] == 'server_error'
+    logs = ''.join(c.args[0] for c in log.call_args_list)
+    assert 'stage=1 device=CPU:1 operation=transfer exception=PlacedInferenceError' in logs
+    assert 'backend private data' not in logs and 'private prompt' not in logs and 'Traceback' not in logs
+    assert b'backend private data' not in body and b'private prompt' not in body
+
+  @pytest.mark.parametrize('error', [BrokenPipeError,ConnectionResetError])
+  def test_socket_write_disconnect_does_not_poison_real_model(self,tmp_path,error):
+    model, _ = load_pair(tmp_path)
+    handler = Mock(server=SimpleNamespace(model=model,tok=tokenizer()))
+    chunks = Handler.run_model(handler,[1,2],'offline',max_tokens=3)
+    writes = []
+    def write(data):
+      writes.append(data)
+      if len(writes) == 3: raise error('client disconnected')
+    handler.wfile.write.side_effect = write
+    Handler.stream_json(handler,chunks)
+    model.check_available()
+    assert not model._placed.lock.locked() and len(model._cached_tokens) == 3
+    assert not any(b'[DONE]' in data for data in writes)
+    # A clean token-boundary close preserves a reusable prefix for the next real request.
+    with running_server(model) as server:
+      status, _, _ = request(server,max_tokens=1)
+      assert status == 200
+    model.check_available()

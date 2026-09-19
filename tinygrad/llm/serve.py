@@ -3,6 +3,8 @@ import copy, json, math, pathlib, re, socket, time, typing, uuid
 from typing import TYPE_CHECKING
 from tinygrad.helpers import DEBUG, colored, stderr_log
 from tinygrad.viz.serve import TCPServerWithReuse, Handler as VizHandler
+from tinygrad.llm.placement import LayerPlacement
+from tinygrad.llm.model import PlacedInferenceError, PlacedModelUnavailableError, PlacedModelBusyError
 if TYPE_CHECKING:
   from tinygrad.llm.cli import SimpleTokenizer
   from tinygrad.llm.model import Transformer
@@ -59,6 +61,14 @@ class StreamRouter:
     emit, found = self.split("<tool_call>", final)
     if emit: yield "content", emit
     if found: self.mode, self.buf = "tool", "<tool_call>" + self.buf
+
+def log_placed_failure(exc:PlacedInferenceError):
+  # Use only bounded metadata, never str(exc), its cause, prompts or backend traceback text.
+  stage = str(exc.stage) if type(exc.stage) is int and 0 <= exc.stage < 1000000 else 'unknown'
+  device = exc.device if isinstance(exc.device, str) and re.fullmatch(r'(CPU|PYTHON|AMD|NV|CUDA)(?::[0-9]{1,10})?', exc.device) else 'unknown'
+  operation = exc.operation if exc.operation in ('stage','transfer','sample','input','direct','generation','warmup','reset') else 'unknown'
+  stderr_log(f'placed inference failure: stage={stage} device={device} operation={operation} exception=PlacedInferenceError; reload required\n')
+
 
 class Handler(VizHandler):
   server: LLMServer
@@ -243,6 +253,16 @@ class Handler(VizHandler):
         try: embeddings = embed_prompt(self.server.model, self.server.vision, prepared)
         except Exception:
           return self.send_data(json.dumps({"error":{"message":"vision inference failed", "type":"server_error"}}).encode(), status_code=500)
+      # stream_json sends headers before advancing run_model (which itself first yields a role chunk).
+      # Check synchronously, not by priming a generator. Mock's dynamic attributes are not placement.
+      placed = isinstance(getattr(self.server.model, 'placement', None), LayerPlacement)
+      if placed:
+        try: self.server.model.check_available()
+        except PlacedModelUnavailableError:
+          return self.send_data(json.dumps({"error":{"message":"placed model unavailable; reload required", "type":"server_error"}}).encode(),
+                                status_code=503)
+        except PlacedModelBusyError:
+          return self.send_data(json.dumps({"error":{"message":"placed model is in use", "type":"server_error"}}).encode(), status_code=409)
       # reply
       max_tokens = body.get("max_completion_tokens")
       if max_tokens is None: max_tokens = body.get("max_tokens")
@@ -253,14 +273,27 @@ class Handler(VizHandler):
                               max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
                               reasoning=starts_reasoning, embeddings=embeddings)
       if body.get("stream"):
-        def guarded_stream():
-          try: yield from chunks
-          except Exception: yield {"error":{"message":"generation failed", "type":"server_error"}}
+        if placed:
+          try: self.stream_json(chunks)
+          except PlacedInferenceError as exc:
+            # Outside stream_json: backend socket-like failures have already been wrapped by the model.
+            # Interrupt iteration without success finish/[DONE]; socket write disconnects remain the streamer's job.
+            log_placed_failure(exc)
+            self.close_connection = True
           finally: chunks.close()
-        self.stream_json(guarded_stream())
+        else:
+          def guarded_stream():
+            try: yield from chunks
+            except Exception: yield {"error":{"message":"generation failed", "type":"server_error"}}
+            finally: chunks.close()
+          self.stream_json(guarded_stream())
       else:
         try: results = list(chunks)
+        except PlacedInferenceError as exc:
+          if placed: log_placed_failure(exc)
+          return self.send_data(json.dumps({"error":{"message":"generation failed", "type":"server_error"}}).encode(), status_code=500)
         except Exception:
+          if placed: raise  # Do not misclassify programmer/protocol errors as placed inference failures.
           return self.send_data(json.dumps({"error":{"message":"generation failed", "type":"server_error"}}).encode(), status_code=500)
         finally: chunks.close()
         out, reasoning, tool_calls, finish_reason = [], [], [], "stop"
@@ -283,6 +316,8 @@ class Handler(VizHandler):
 class LLMServer(TCPServerWithReuse):
   def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any,
                *, vision=None, image_limits=None, max_output_tokens:int|None=None):
+    if isinstance(getattr(model, 'placement', None), LayerPlacement) and vision is not None:
+      raise ValueError("placement does not support vision")
     if max_output_tokens is not None and (type(max_output_tokens) is not int or max_output_tokens <= 0):
       raise ValueError("max_output_tokens must be positive")
     self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
