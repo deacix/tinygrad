@@ -82,7 +82,7 @@ def native_text_run(model, arrays, lengths):
   return {k: v if k == "snapshots" else np.concatenate(v, axis=1) for k, v in result.items()}
 
 
-def compare_native_text(manifest, arrays):
+def compare_native_text(manifest, arrays, modes=("full", "tokenwise", "chunked", "prefill_decode")):
   """Shared assertions/metrics for the offline unit gate and --phase text --synthetic."""
   tier = manifest["parity_tiers"]["native_cast"]["lowered_fp32_weights"]
   prefix, tolerance = tier["prefix"] + ".full", tier["tolerance"]
@@ -101,6 +101,7 @@ def compare_native_text(manifest, arrays):
                      "max_relative": float(relative.max()), "mean_relative": float(relative.mean())}
     np.testing.assert_allclose(actual, expected, **tolerance, err_msg=name)
   for mode, lengths in (("full", [10]), ("tokenwise", [1]*10), ("chunked", [3, 2, 5]), ("prefill_decode", [6, 1, 1, 1, 1])):
+    if mode not in modes: continue
     result = native_text_run(model, arrays, lengths)
     for component in ("logits", "block.0", "block.1"):
       compare(f"{mode}.{component}", result[component], arrays[f"{prefix}.{component}"])
@@ -129,10 +130,16 @@ def compare_native_text(manifest, arrays):
 
 
 class TestQwenNativeText(unittest.TestCase):
-  def test_native_text_parity(self):
+  def check_mode(self, mode):
     m, a = load_fixture()
     self.assertEqual(m["parity_tiers"]["native_cast"]["status"], "captured")
-    compare_native_text(m, a)
+    compare_native_text(m, a, modes=(mode,))
+
+  # Separate unchanged comparisons so each stays inside CI's per-test deadline.
+  def test_native_text_parity_full(self): self.check_mode("full")
+  def test_native_text_parity_tokenwise(self): self.check_mode("tokenwise")
+  def test_native_text_parity_chunked(self): self.check_mode("chunked")
+  def test_native_text_parity_prefill_decode(self): self.check_mode("prefill_decode")
 
   def test_native_text_mapping_and_sampling(self):
     m, a = load_fixture()
