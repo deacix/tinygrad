@@ -14,9 +14,12 @@ files. --verify needs only NumPy; regeneration needs the reference environment.
   python test/external/external_qwen_vl.py --phase text --synthetic
 
 Text phase uses tinygrad and the offline cast-tier fixtures (no reference install).
-A1/A2 only: no image fusion, full checkpoint, quantized or hardware acceptance claims.
+  python test/external/external_qwen_vl.py --phase fusion --synthetic
+Fusion phase uses the pinned reference environment plus tinygrad, reusing existing
+arrays for live complete synthetic vision/fusion/hybrid prefill and decode parity.
+Neither phase establishes full checkpoint, quantized or hardware acceptance.
 """
-import argparse, hashlib, importlib.metadata, io, json, platform, tempfile, zipfile, zlib
+import argparse, contextlib, hashlib, importlib.metadata, io, json, platform, tempfile, zipfile, zlib
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -491,25 +494,134 @@ def verify(directory):
   if deterministic_npz(arrays) != raw: raise ValueError("noncanonical NPZ archive")
   print(f"Verified {len(arrays)} arrays; npz sha256={digest(raw)}")
 
+def fusion_phase(manifest, arrays):
+  """Live pinned complete synthetic vision->fusion->hybrid logits, not merely rotary component parity.
+
+  Reuses immutable A1/A2 weights/pixels; writes no old arrays. Requires the reference environment AND tinygrad.
+  FP32 HF, explicit native casts and existing lowered FP32-weight casts are separate executions/metrics.
+  """
+  from dataclasses import replace
+  from tinygrad import Tensor, nn, dtypes, Device
+  from tinygrad.llm.multimodal import PreparedPrompt, embed_prompt, image_positions
+  from tinygrad.llm.vision import QwenVision, VisionConfig
+  from test.unit.test_llm_multimodal import native_text_model
+  from transformers.cache_utils import Cache
+  torch, hf = reference_imports()
+  cfg = hf.Qwen3_5Config(text_config=TEXT, vision_config=VISION, image_token_id=248056 % 64,
+                         vision_start_token_id=248053 % 64, vision_end_token_id=248054 % 64, video_token_id=248057 % 64)
+  cfg._attn_implementation = "eager"
+  oracle = hf.Qwen3_5ForConditionalGeneration(cfg).eval()
+  state = {}
+  for key, value in arrays.items():
+    if key.startswith("vision.weights."): state["model.visual."+key.removeprefix("vision.weights.")] = torch.from_numpy(value)
+    if key.startswith("text.weights."):
+      name = key.removeprefix("text.weights.")
+      state[name.replace("model.", "model.language_model.", 1) if name.startswith("model.") else name] = torch.from_numpy(value)
+  oracle.load_state_dict(state, strict=True)
+  native, _, _ = native_text_model(manifest, arrays)
+  for block in native.blk: block.config = replace(block.config, rope_sections=(2, 1, 1))
+  vision = QwenVision(VisionConfig.from_dict(VISION))
+  nn.state.load_state_dict(vision, {k.removeprefix("vision.weights."):Tensor(v) for k,v in arrays.items() if k.startswith("vision.weights.")},
+                          verbose=False)
+  # Only the tiny test vocabulary maps official marker IDs. Production uses the audited GGUF tokenizer/table unchanged.
+  embedding = native.token_embd
+  class SmallVocabulary:
+    weight = embedding.weight
+    def __call__(self, ids): return embedding(ids % TEXT["vocab_size"])
+  native.token_embd = SmallVocabulary()
+  metrics, final_logits = {}, []
+  def compare(name, actual, expected, assert_close=True):
+    assert np.isfinite(actual).all() and np.isfinite(expected).all(), name
+    metrics[name] = error_metrics(actual, expected)
+    if assert_close: np.testing.assert_allclose(actual, expected, **TOLERANCE, err_msg=name)
+  gdn = oracle.model.language_model.layers[0].linear_attn
+  original_update = Cache.update
+  def update(cache, key, value, *args, **kwargs):
+    k, v = original_update(cache, key.half(), value.half(), *args, **kwargs)
+    return k.float(), v.float()
+  def round_input(_module, inputs, kwargs): return inputs, kwargs | {"hidden_states":kwargs["hidden_states"].half().float()}
+  def round_output(_module, inputs): return (inputs[0].half().float(), *inputs[1:])
+  with torch.no_grad():
+    for case, variant in (("rectangle", 0), ("two_images", 0), ("two_images", 1)):
+      label, prefix = f"{case}.pixels{variant}", f"coordinates.{case}."
+      tokens = arrays[prefix+"input_ids"][0].tolist()
+      grids = tuple(tuple(int(v) for v in g) for g in arrays[prefix+"grid_thw"])
+      spans = tuple(tuple(int(v) for v in s) for s in arrays[prefix+"image_spans"])
+      pos, delta = image_positions(tuple(tokens), grids, spans)
+      np.testing.assert_array_equal(pos, arrays[prefix+"position_ids"])
+      assert delta == int(arrays[prefix+"rope_delta"].item())
+      pixels = arrays["vision.pixel_values"][:sum(h*w for _,h,w in grids)].copy() * (1 if variant == 0 else -1)
+      prompt = PreparedPrompt(tuple(tokens), Tensor(pixels), grids, spans, Tensor(pos), delta)
+      with patch.object(QwenVision, "__call__", autospec=True, side_effect=QwenVision.__call__) as encode:
+        fused = embed_prompt(native, vision, prompt)
+        encode.assert_called_once()
+      references = {}
+      for tier in ("hf_fp32", "native_cast", "native_lowered"):
+        capture, handles = {}, []
+        def capture_inputs(_module, args, kwargs):
+          capture["embeddings"], capture["positions"] = kwargs["inputs_embeds"].clone(), kwargs["position_ids"].clone()
+        handles.append(oracle.model.language_model.register_forward_pre_hook(capture_inputs, with_kwargs=True))
+        if tier != "hf_fp32": handles.append(gdn.out_proj.register_forward_pre_hook(round_output))
+        if tier == "native_cast": handles.append(gdn.register_forward_pre_hook(round_input, with_kwargs=True))
+        oracle.model.rope_deltas = None
+        with patch.object(Cache, "update", update) if tier != "hf_fp32" else contextlib.nullcontext():
+          output = oracle(input_ids=torch.tensor([tokens]) % 64, pixel_values=torch.from_numpy(pixels),
+                          image_grid_thw=torch.tensor(grids), mm_token_type_ids=torch.from_numpy(arrays[prefix+"mm_token_type_ids"]), use_cache=True)
+          for handle in handles[:1]: handle.remove()
+          result = {"embeddings":capture["embeddings"].numpy(), "positions":capture["positions"].numpy(),
+                    "logits":[output.logits[:, -1].numpy()], "tokens":[]}
+          for step in range(6):
+            token = output.logits[:, -1].argmax(-1, keepdim=True)
+            result["tokens"].append(int(token.item()))
+            if step < 5:
+              output = oracle(input_ids=token, past_key_values=output.past_key_values, use_cache=True)
+              result["logits"].append(output.logits[:, -1].numpy())
+          references[tier] = result
+        for handle in handles[1:]: handle.remove()
+      ref = references["native_lowered"]
+      compare(label+".fused_embeddings", fused.numpy(), ref["embeddings"])
+      np.testing.assert_array_equal(pos, ref["positions"])
+      logits = native.forward_embeddings(fused, 0, Tensor(pos)).numpy()
+      compare(label+".prefill_logits", logits, ref["logits"][0])
+      final_logits.append(logits)
+      for step in range(5):
+        physical = len(tokens)+step
+        logits = native.forward_embeddings(embedding(Tensor([[ref["tokens"][step]]], dtype=dtypes.int32)).float(), physical,
+                    Tensor.full((3,1,1), physical+delta, dtype=dtypes.int32)).numpy()
+        compare(label+f".decode_logits.{step}", logits, ref["logits"][step+1])
+      gen = native.generate([t % 64 for t in tokens], inputs_embeds=fused, position_ids=Tensor(pos), rope_delta=delta)
+      try: assert [next(gen) for _ in range(6)] == ref["tokens"]
+      finally: gen.close()
+      for tier in ("native_cast", "hf_fp32"):
+        compare(label+f".lowered_vs_{tier}", np.concatenate(ref["logits"]), np.concatenate(references[tier]["logits"]), False)
+  assert np.abs(final_logits[-1]-final_logits[-2]).max() > 1e-3, "pixel ablation must change fused decoder logits"
+  return {"phase":"fusion", "synthetic":True, "device":Device.DEFAULT, "versions":VERSIONS, "transformers_commit":COMMIT,
+          "tolerance":TOLERANCE, "scope":"Complete tiny weighted vision + hybrid decoder, prefill and five decode steps; "
+          "native comparisons use the lowered FP32-weight cast oracle. No checkpoint/quantized/hardware acceptance.", "metrics":metrics}
+
+
 def main():
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   mode = parser.add_mutually_exclusive_group(required=True)
   mode.add_argument("--generate", action="store_true")
   mode.add_argument("--verify", action="store_true")
   mode.add_argument("--check-reproducible", action="store_true")
-  mode.add_argument("--phase", choices=("text",))
-  parser.add_argument("--synthetic", action="store_true", help="Required for the native text phase; no checkpoint execution")
+  mode.add_argument("--phase", choices=("text", "fusion"))
+  parser.add_argument("--synthetic", action="store_true", help="Required for the synthetic text/fusion phases; no checkpoint execution")
   parser.add_argument("--output-dir", type=Path, default=ROOT)
   parser.add_argument("--metadata-dir", type=Path, help="Bootstrap only: directory containing the two pinned metadata JSON files")
   args = parser.parse_args()
   if args.metadata_dir is not None and not args.generate: parser.error("--metadata-dir requires --generate")
-  if bool(args.phase) != args.synthetic: parser.error("--phase text requires --synthetic (and vice versa)")
+  if bool(args.phase) != args.synthetic: parser.error("--phase requires --synthetic (and vice versa)")
   if args.phase:
     verify(args.output_dir)
     from tinygrad import Device
     from test.unit.test_llm_multimodal import compare_native_text
     manifest = json.loads((args.output_dir / "manifest.json").read_text())
     with np.load(args.output_dir / "reference.npz", allow_pickle=False) as src: arrays = {k: src[k] for k in src.files}
+    if args.phase == "fusion":
+      print(json.dumps(fusion_phase(manifest, arrays), indent=2))
+      return
     metrics = compare_native_text(manifest, arrays)
     tier = manifest["parity_tiers"]["native_cast"]["lowered_fp32_weights"]
     print(json.dumps({"phase": "text", "synthetic": True, "device": Device.DEFAULT, "tier": "native_cast.lowered_fp32_weights",
