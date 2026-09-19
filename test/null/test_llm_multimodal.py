@@ -188,4 +188,34 @@ class TestQwenPreprocess(unittest.TestCase):
     with self.assertRaises(ImageInputError):
       preprocess_image("data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(), ImageLimits())
 
+class TestQwenCLI(unittest.TestCase):
+  def test_cli_flags(self):
+    from tinygrad.llm.cli import parse_args
+    args = parse_args(["--vision-dir", "/model", "--image", "a.png", "--image", "b.jpg", "--prompt", "Compare"])
+    self.assertEqual(args.image, ["a.png", "b.jpg"])
+    self.assertEqual(args.max_output_tokens, 256)
+    self.assertEqual(args.image_max_pixels, 262144)
+    for argv in (["--image", "x"], ["--prompt", "x"], ["--max-output-tokens", "0"],
+                 ["--vision-dir", "x", "--no_chat_template"], ["--vision-dir", "x", "--max-images", "5"],
+                 ["--vision-dir", "x", "--image", "x", "--prompt", "x", "--serve"],
+                 ["--vision-dir", "x", "--image-max-pixels", "3"]):
+      with self.subTest(argv=argv), self.assertRaises(SystemExit): parse_args(argv)
+
+  def test_cli_local_image_canonical(self):
+    from PIL import Image
+    import tempfile
+    from tinygrad.llm.multimodal import ImageLimits, ImageInputError, local_image_url, preprocess_image
+    with tempfile.TemporaryDirectory() as tmp:
+      path = Path(tmp)/"image.bin"
+      image = Image.new("RGB", (256,256), "red")
+      image.save(path, format="PNG")
+      url = local_image_url(path, ImageLimits())
+      a, grid = preprocess_image(url, ImageLimits())
+      b, expected_grid = preprocess_image(TestQwenPreprocess.image_url(image), ImageLimits())
+      np.testing.assert_array_equal(a,b)
+      self.assertEqual(grid, expected_grid)
+      with self.assertRaises(ImageInputError): local_image_url(path, ImageLimits(max_image_bytes=1))
+      path.write_bytes(b"invalid")
+      with self.assertRaises(ImageInputError): local_image_url(path, ImageLimits())
+
 if __name__ == "__main__": unittest.main()
