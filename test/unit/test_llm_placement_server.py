@@ -283,7 +283,7 @@ class TestPlacementHTTP:
       retry, _, retry_body = request(server,stream=True)
     assert retry == 503 and b'[DONE]' not in retry_body
     assert model.closed == [True] and model.state == 'failed'
-    if stream:
+    if stream and fail_after:
       assert status == 200 and content_type == 'text/event-stream'
       assert b'[DONE]' not in body and b'"server_error"' not in body
       assert all(c['choices'][0]['finish_reason'] is None for c in events(body))
@@ -449,6 +449,65 @@ class TestPlacementHTTP:
 
 
 class TestPlacementHTTPRealCPU:
+  @pytest.mark.parametrize('stream', [False,True])
+  @pytest.mark.parametrize('cap', [None,3])
+  def test_context_exhaustion_reports_length(self,tmp_path,stream,cap):
+    model, _ = load_pair(tmp_path)
+    with running_server(model) as server:
+      server.tok.encode.side_effect = lambda text: [1,2]*15
+      status, _, body = request(server,stream=stream,**({'max_tokens':cap} if cap is not None else {}))
+    assert status == 200
+    result = events(body)[-1] if stream else json.loads(body)
+    assert result['choices'][0]['finish_reason'] == 'length'
+    model.check_available()
+
+  @pytest.mark.parametrize('stream', [False,True])
+  def test_admission_during_direct_input_validation_is_busy(self,tmp_path,stream):
+    from tinygrad import Tensor, dtypes
+    model, _ = load_pair(tmp_path)
+    tokens = Tensor([[3]],dtype=dtypes.int32,device='CPU').realize()
+    temp = Tensor([0.],dtype=dtypes.float32,device='CPU:1').realize()
+    entered, release = threading.Event(), threading.Event()
+    errors, item = [], Tensor.item
+    def read(t):
+      if t is temp:
+        entered.set()
+        assert release.wait(10)
+      return item(t)
+    def direct():
+      try: model(tokens,0,temp)
+      except Exception as exc: errors.append(exc)
+    with patch.object(Tensor,'item',read), running_server(model) as server:
+      worker = threading.Thread(target=direct)
+      worker.start()
+      try:
+        assert entered.wait(5) and model._placed.lock.locked()
+        status, content_type, body = request(server,stream=stream)
+        assert status == 409 and content_type == 'application/json' and b'[DONE]' not in body
+      finally:
+        release.set()
+        worker.join(10)
+    assert not errors and not worker.is_alive()
+    model.check_available()
+
+  @pytest.mark.parametrize('stream', [False,True])
+  def test_busy_after_availability_snapshot_is_still_preheader(self,tmp_path,stream):
+    model, _ = load_pair(tmp_path)
+    holder = model.generate([3,1])
+    original, admitted = model.check_available, []
+    def check():
+      original()
+      if not admitted:
+        admitted.append(True)
+        next(holder)
+    with patch.object(model,'check_available',check), running_server(model) as server:
+      try:
+        status, content_type, body = request(server,stream=stream)
+        assert status == 409 and content_type == 'application/json' and b'[DONE]' not in body
+        assert model._placed.state == 'generating'
+      finally: holder.close()
+    model.check_available()
+
   def test_actual_placement_vision_rejected_before_binding_socket(self,tmp_path):
     model, _ = load_pair(tmp_path)
     with patch.object(socket.socket,'bind',side_effect=AssertionError('socket opened')), pytest.raises(ValueError,match='placement.*vision'):

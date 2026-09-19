@@ -1,5 +1,5 @@
 from __future__ import annotations
-import copy, json, math, pathlib, re, socket, time, typing, uuid
+import copy, itertools, json, math, pathlib, re, socket, time, typing, uuid
 from typing import TYPE_CHECKING
 from tinygrad.helpers import DEBUG, colored, stderr_log
 from tinygrad.viz.serve import TCPServerWithReuse, Handler as VizHandler
@@ -93,6 +93,7 @@ class Handler(VizHandler):
     prompt_tokens = len(ids)
     remaining = model.max_context-prompt_tokens
     if generation_kwargs: max_tokens = min(max_tokens or self.server.max_output_tokens or 256, remaining)
+    elif isinstance(getattr(model, 'placement', None), LayerPlacement): max_tokens = min(max_tokens or remaining, remaining)
     cache_start_pos = 0 if generation_kwargs else model.get_start_pos(ids)
     stderr_log(f"in:{colored(f'{cache_start_pos:5d}', 'green')} +{len(ids)-cache_start_pos:5d}  {colored('--', 'BLACK')}  ")
     tmpl = {"id":f"chatcmpl-{uuid.uuid4().hex[:24]}", "object":"chat.completion.chunk", "created":int(time.time()), "model":model_name}
@@ -274,7 +275,26 @@ class Handler(VizHandler):
                               reasoning=starts_reasoning, embeddings=embeddings)
       if body.get("stream"):
         if placed:
-          try: self.stream_json(chunks)
+          # Advance past the role chunk before headers: acquiring the generation transaction can race the availability snapshot.
+          # Retain this generator (and its ownership) through streaming; prefix buffering is bounded to the first yielded delta.
+          try:
+            role, first = next(chunks), next(chunks)
+          except (PlacedModelUnavailableError, PlacedModelBusyError) as exc:
+            chunks.close()
+            status = 503 if isinstance(exc, PlacedModelUnavailableError) else 409
+            return self.send_data(json.dumps({"error":{"message":"placed model unavailable or busy", "type":"server_error"}}).encode(),
+                                  status_code=status)
+          except PlacedInferenceError as exc:
+            chunks.close()
+            log_placed_failure(exc)
+            return self.send_data(json.dumps({"error":{"message":"generation failed", "type":"server_error"}}).encode(), status_code=500)
+          except BaseException:
+            chunks.close()
+            raise
+          def placed_stream():
+            try: yield from itertools.chain((role, first), chunks)
+            finally: chunks.close()
+          try: self.stream_json(placed_stream())
           except PlacedInferenceError as exc:
             # Outside stream_json: backend socket-like failures have already been wrapped by the model.
             # Interrupt iteration without success finish/[DONE]; socket write disconnects remain the streamer's job.
@@ -289,6 +309,10 @@ class Handler(VizHandler):
           self.stream_json(guarded_stream())
       else:
         try: results = list(chunks)
+        except (PlacedModelUnavailableError, PlacedModelBusyError) as exc:
+          if not placed: raise
+          return self.send_data(json.dumps({"error":{"message":"placed model unavailable or busy", "type":"server_error"}}).encode(),
+                                status_code=503 if isinstance(exc, PlacedModelUnavailableError) else 409)
         except PlacedInferenceError as exc:
           if placed: log_placed_failure(exc)
           return self.send_data(json.dumps({"error":{"message":"generation failed", "type":"server_error"}}).encode(), status_code=500)
