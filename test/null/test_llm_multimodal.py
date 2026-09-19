@@ -110,4 +110,82 @@ class TestQwenFixtureContracts(unittest.TestCase):
     self.assertEqual(int(arrays["coordinates.square256.rope_delta"][0, 0]), -56)
     self.assertEqual(int(arrays["coordinates.square1024.rope_delta"][0, 0]), -992)
 
+class TestQwenPreprocess(unittest.TestCase):
+  @staticmethod
+  def image_url(image, image_format="PNG"):
+    import base64
+    buf = io.BytesIO()
+    image.save(buf, format=image_format)
+    return f"data:image/{'jpeg' if image_format == 'JPEG' else 'png'};base64," + base64.b64encode(buf.getvalue()).decode()
+
+  def test_preprocess_reference(self):
+    from PIL import Image
+    from tinygrad.llm.multimodal import ImageLimits, preprocess_image
+    m, arrays = load_fixture()
+    for case in m["processor_cases"]:
+      p = "processor." + case["name"] + "."
+      pixels, grid = preprocess_image(self.image_url(Image.fromarray(arrays[p + "rgb"])), ImageLimits())
+      self.assertEqual(grid, tuple(arrays[p + "grid_thw"][0]))
+      np.testing.assert_array_equal(pixels, arrays[p + "pixel_values"])
+
+  def test_preprocess_color_modes(self):
+    from PIL import Image
+    from tinygrad.llm.multimodal import ImageLimits, preprocess_image
+    for mode in ("L", "RGBA", "RGB"):
+      image = Image.new(mode, (256, 256))
+      actual, grid = preprocess_image(self.image_url(image), ImageLimits())
+      expected, _ = preprocess_image(self.image_url(image.convert("RGB")), ImageLimits())
+      np.testing.assert_array_equal(actual, expected)
+      self.assertEqual(grid, (1, 16, 16))
+
+  def test_preprocess_jpeg_and_exif(self):
+    from PIL import Image, ImageOps
+    from tinygrad.llm.multimodal import ImageLimits, preprocess_image
+    image = Image.fromarray(np.arange(128*256*3, dtype=np.uint8).reshape(128, 256, 3))
+    exif = Image.Exif()
+    exif[274] = 6
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", exif=exif)
+    import base64
+    url = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+    actual, grid = preprocess_image(url, ImageLimits())
+    canonical = ImageOps.exif_transpose(Image.open(io.BytesIO(buf.getvalue()))).convert("RGB")
+    expected, expected_grid = preprocess_image(self.image_url(canonical), ImageLimits())
+    self.assertEqual(grid, expected_grid)
+    np.testing.assert_array_equal(actual, expected)
+
+  def test_limits_invalid_input(self):
+    from PIL import Image
+    from tinygrad.llm.multimodal import ImageLimits, ImageInputError, preprocess_image
+    for url in ("https://example.com/image.png", "/tmp/image.png", "data:image/gif;base64,AAAA", "data:image/png;base64,!!!",
+                "data:image/png;base64,aA==", "data:image/png;base64,", 4, None):
+      with self.subTest(url=url), self.assertRaises(ImageInputError): preprocess_image(url, ImageLimits())
+    for kwargs in ({"max_pixels":True}, {"max_pixels":0}, {"max_pixels":16777217}, {"max_images":5}, {"max_visual_tokens":0}):
+      with self.subTest(kwargs=kwargs), self.assertRaises(ValueError): ImageLimits(**kwargs)
+    url = self.image_url(Image.new("RGB", (256, 256)))
+    with self.assertRaises(ImageInputError): preprocess_image(url.replace("image/png", "image/jpeg"), ImageLimits())
+    with self.assertRaises(ImageInputError): preprocess_image(url, ImageLimits(max_image_bytes=32))
+    with self.assertRaises(ImageInputError): preprocess_image(url, ImageLimits(max_original_pixels=100))
+    with self.assertRaises(ImageInputError): preprocess_image(self.image_url(Image.new("RGB", (1, 201))), ImageLimits())
+
+  def test_limits_resize_and_dependency(self):
+    from PIL import Image
+    from unittest.mock import patch
+    from tinygrad.llm.multimodal import ImageLimits, ImageInputError, image_size, preprocess_image
+    self.assertEqual(image_size(256, 272, ImageLimits()), (256, 256))
+    with self.assertRaises(ImageInputError): image_size(1, 200, ImageLimits(max_pixels=65536))
+    with self.assertRaises(ImageInputError): image_size(512, 512, ImageLimits(max_visual_tokens=64))
+    url = self.image_url(Image.new("RGB", (256, 256)))
+    with patch.dict("sys.modules", {"PIL":None}):
+      with self.assertRaisesRegex(ImageInputError, r"tinygrad\[vision\]"): preprocess_image(url, ImageLimits())
+
+  def test_limits_animation(self):
+    from PIL import Image
+    from tinygrad.llm.multimodal import ImageLimits, ImageInputError, preprocess_image
+    import base64
+    buf = io.BytesIO()
+    Image.new("RGB", (32, 32), "red").save(buf, format="PNG", save_all=True, append_images=[Image.new("RGB", (32, 32), "blue")])
+    with self.assertRaises(ImageInputError):
+      preprocess_image("data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(), ImageLimits())
+
 if __name__ == "__main__": unittest.main()
