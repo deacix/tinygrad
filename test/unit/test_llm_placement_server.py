@@ -170,6 +170,11 @@ class TestPlacementCLI:
     run_cli(placement_args(path)+['--benchmark','5'],Mock(generate=Mock(return_value=gen)))
     assert gen.closed and gen.advances == 1
 
+  def test_legacy_benchmark_keeps_fixed_count_after_eos(self):
+    gen = TrackedIterator((999,2,3,4,5))
+    run_cli(['--model','legacy.gguf','--benchmark','5'],Mock(generate=Mock(return_value=gen)))
+    assert gen.closed and gen.advances == 5
+
   def test_two_interactive_eos_turns_close_before_next(self,tmp_path):
     path, _ = save_llama(tmp_path)
     gens = [TrackedIterator((2,999)),TrackedIterator((3,999))]

@@ -306,7 +306,7 @@ def main():
           if log:
             with WallTimeEvent(BenchEvent.STEP): next_id = next(gen)
           else: next_id = next(gen)
-        if tok.is_end(next_id): break
+        if args.placement is not None and tok.is_end(next_id): break
     finally: gen.close()
     return
 
