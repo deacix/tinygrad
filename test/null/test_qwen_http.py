@@ -65,6 +65,37 @@ class TestQwenHTTP(unittest.TestCase):
     self.assertEqual(json.loads(body)["choices"][0]["finish_reason"],"length")
     self.assertEqual(self.closed,[True])
 
+  def test_text_server_operator_output_cap(self):
+    self.server.max_output_tokens = 1
+    for options in ({}, {"max_tokens":9}, {"max_completion_tokens":9}):
+      status, body = self.request({"model":"test", "messages":[{"role":"user", "content":"hi"}]} | options)
+      self.assertEqual(status,200)
+      self.assertEqual(json.loads(body)["usage"]["completion_tokens"],1)
+    self.assertEqual(self.closed,[True]*3)
+
+  def test_nullable_stream_options(self):
+    for options in ({"stream":None}, {"stream":False,"stream_options":None}, {"stream":True,"stream_options":None}):
+      status, body = self.request({"model":"test", "messages":[{"role":"user", "content":"hi"}]} | options)
+      self.assertEqual(status,200)
+      if options.get("stream"): self.assertIn(b"[DONE]",body)
+      else: self.assertEqual(json.loads(body)["choices"][0]["message"]["content"],"xx")
+
+  def test_numeric_overflow_and_deep_json_errors(self):
+    body = {"model":"test", "messages":[{"role":"user", "content":"hi"}], "temperature":10**400}
+    self.assertEqual(self.request(body)[0],400)
+    deep = 0
+    for _ in range(40): deep = [deep]
+    self.assertEqual(self.request(body | {"temperature":0, "extra":deep})[0],400)
+    raw = b'{"model":"test","messages":' + b'['*2000 + b']'*2000 + b'}'
+    with socket.create_connection(self.server.server_address, timeout=3) as conn:
+      conn.sendall(f"POST /v1/chat/completions HTTP/1.0\r\nContent-Length: {len(raw)}\r\n\r\n".encode()+raw)
+      conn.shutdown(socket.SHUT_WR)
+      response = b""
+      while chunk := conn.recv(65536): response += chunk
+    self.assertIn(b" 400 ",response.split(b"\r\n",1)[0])
+    self.assertEqual(json.loads(response.split(b"\r\n\r\n",1)[1])["error"]["type"],"invalid_request_error")
+    self.model.generate.assert_not_called()
+
   def test_nullable_completion_alias(self):
     for stream in (False, True):
       status, payload = self.request({"model":"test", "messages":[{"role":"user", "content":"hi"}],

@@ -82,7 +82,7 @@ class Handler(VizHandler):
       ids = list(prompt.tokens)
     prompt_tokens = len(ids)
     remaining = model.max_context-prompt_tokens
-    if generation_kwargs: max_tokens = min(max_tokens or self.server.max_output_tokens, remaining)
+    if generation_kwargs: max_tokens = min(max_tokens or self.server.max_output_tokens or 256, remaining)
     cache_start_pos = 0 if generation_kwargs else model.get_start_pos(ids)
     stderr_log(f"in:{colored(f'{cache_start_pos:5d}', 'green')} +{len(ids)-cache_start_pos:5d}  {colored('--', 'BLACK')}  ")
     tmpl = {"id":f"chatcmpl-{uuid.uuid4().hex[:24]}", "object":"chat.completion.chunk", "created":int(time.time()), "model":model_name}
@@ -160,8 +160,14 @@ class Handler(VizHandler):
         remaining -= len(chunk)
       body = json.loads(b"".join(chunks))
     except ImageInputError: raise
-    except (ValueError, UnicodeError, socket.timeout): raise ImageInputError("invalid or incomplete JSON request") from None
+    except (ValueError, UnicodeError, RecursionError, socket.timeout): raise ImageInputError("invalid or incomplete JSON request") from None
     finally: self.connection.settimeout(previous)
+    stack = [(body, 0)]
+    while stack:
+      value, depth = stack.pop()
+      if depth > 32: raise ImageInputError("request JSON nesting exceeds 32 levels")
+      if isinstance(value, dict): stack.extend((item,depth+1) for item in value.values())
+      elif isinstance(value, list): stack.extend((item,depth+1) for item in value)
     if not isinstance(body, dict) or not isinstance(body.get("model"), str): raise ImageInputError("request model must be a string")
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages: raise ImageInputError("messages must be a nonempty array")
@@ -181,9 +187,13 @@ class Handler(VizHandler):
     for key in ("max_completion_tokens", "max_tokens"):
       if key in body and body[key] is not None and (type(body[key]) is not int or body[key] <= 0): raise ImageInputError(f"{key} must be positive")
     temperature = body.get("temperature", 0.0)
-    if type(temperature) not in (int,float) or not math.isfinite(temperature) or temperature < 0: raise ImageInputError("invalid temperature")
-    if "stream" in body and type(body["stream"]) is not bool: raise ImageInputError("stream must be boolean")
-    if not isinstance(body.get("stream_options", {}), dict): raise ImageInputError("invalid stream options")
+    try: valid_temperature = type(temperature) in (int,float) and math.isfinite(temperature) and temperature >= 0
+    except OverflowError: valid_temperature = False
+    if not valid_temperature: raise ImageInputError("invalid temperature")
+    if body.get("stream") is None: body["stream"] = False
+    if type(body["stream"]) is not bool: raise ImageInputError("stream must be boolean")
+    if body.get("stream_options") is None: body["stream_options"] = {}
+    if not isinstance(body["stream_options"], dict): raise ImageInputError("invalid stream options")
     if not isinstance(body.get("chat_template_kwargs", {}), dict): raise ImageInputError("invalid chat template options")
     if body.get("tools") is not None and not isinstance(body["tools"], list): raise ImageInputError("tools must be an array")
     return body
@@ -212,7 +222,7 @@ class Handler(VizHandler):
         rendered = self.server.template.render(messages=messages, tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True)
         ids = self.server.tok.encode(rendered)
         starts_reasoning = rendered.rstrip().endswith("<think>")
-    except (ImageInputError, ValueError, TypeError, KeyError) as exc:
+    except (ImageInputError, ValueError, TypeError, KeyError, RecursionError) as exc:
       status = exc.status if isinstance(exc, ImageInputError) else 400
       return self.send_data(json.dumps({"error":{"message":str(exc), "type":"invalid_request_error", "param":"messages"}}).encode(),
                             status_code=status)
@@ -234,7 +244,8 @@ class Handler(VizHandler):
       # reply
       max_tokens = body.get("max_completion_tokens")
       if max_tokens is None: max_tokens = body.get("max_tokens")
-      if prepared is not None: max_tokens = min(max_tokens or self.server.max_output_tokens, self.server.max_output_tokens)
+      if self.server.max_output_tokens is not None:
+        max_tokens = min(max_tokens or self.server.max_output_tokens, self.server.max_output_tokens)
       chunks = self.run_model(prepared if prepared is not None else ids, body["model"],
                               not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
                               max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
@@ -269,7 +280,10 @@ class Handler(VizHandler):
 
 class LLMServer(TCPServerWithReuse):
   def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any,
-               *, vision=None, image_limits=None, max_output_tokens:int=256):
+               *, vision=None, image_limits=None, max_output_tokens:int|None=None):
+    if max_output_tokens is not None and (type(max_output_tokens) is not int or max_output_tokens <= 0):
+      raise ValueError("max_output_tokens must be positive")
     self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
-    self.vision, self.image_limits, self.max_output_tokens = vision, image_limits, max_output_tokens
+    self.vision, self.image_limits = vision, image_limits
+    self.max_output_tokens = 256 if vision is not None and max_output_tokens is None else max_output_tokens
     super().__init__(server_address, Handler)

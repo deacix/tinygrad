@@ -537,8 +537,9 @@ class Transformer:
       if inputs_embeds.device != device or position_ids.device != device:
         raise ValueError("embeddings and positions must be on the decoder device")
       if type(chunk_size) is not int or chunk_size <= 0: raise ValueError("chunk_size must be positive")
-      if not isinstance(temperature, (float, int)) or not math.isfinite(temperature) or temperature < 0:
-        raise ValueError("temperature must be finite and nonnegative")
+      try: valid_temperature = type(temperature) in (float, int) and math.isfinite(temperature) and temperature >= 0
+      except OverflowError: valid_temperature = False
+      if not valid_temperature: raise ValueError("temperature must be finite and nonnegative")
       if type(rope_delta) is not int or not 0 <= length+rope_delta <= self.max_context+rope_delta < 2**31:
         raise ValueError("invalid rope_delta")
       if any(type(t) is not int or not 0 <= t < self.token_embd.weight.shape[0] for t in tokens): raise ValueError("invalid token ID")

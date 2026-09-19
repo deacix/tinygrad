@@ -149,12 +149,13 @@ def parse_args(argv:list[str]|None=None):
   parser.add_argument("--vision-dir", type=str, help="Directory containing the pinned Qwen3.8 visual bundle")
   parser.add_argument("--image", action="append", default=[], help="Local PNG/JPEG image for a one-shot prompt (repeatable)")
   parser.add_argument("--prompt", help="One-shot text question for --image")
-  parser.add_argument("--max-output-tokens", type=int, default=256)
+  parser.add_argument("--max-output-tokens", type=int, help="Output cap (default 256 for vision, uncapped legacy text)")
   parser.add_argument("--image-max-pixels", type=int, default=262144)
   parser.add_argument("--max-images", type=int, default=4)
   parser.add_argument("--max-visual-tokens", type=int, default=1024)
   args = parser.parse_args(argv)
-  if args.max_context <= 0 or args.max_output_tokens <= 0: parser.error("context and output limits must be positive")
+  if args.max_context <= 0 or (args.max_output_tokens is not None and args.max_output_tokens <= 0):
+    parser.error("context and output limits must be positive")
   if bool(args.image) != (args.prompt is not None): parser.error("--image and --prompt must be supplied together")
   if args.image and (args.serve is not None or args.benchmark is not None): parser.error("one-shot images conflict with serving/benchmark")
   if args.image and not args.vision_dir: parser.error("--image requires --vision-dir")
@@ -164,6 +165,9 @@ def parse_args(argv:list[str]|None=None):
     except ValueError as exc: parser.error(str(exc))
     if args.no_chat_template: parser.error("vision requires the verified chat template")
     if len(args.image) > args.max_images: parser.error("image count limit exceeded")
+    if args.max_output_tokens is None: args.max_output_tokens = 256
+  elif args.max_output_tokens is not None and args.serve is None:
+    parser.error("--max-output-tokens requires --serve or --vision-dir")
   return args
 
 def main():
@@ -175,7 +179,7 @@ def main():
     from pathlib import Path
     from tinygrad.llm.vision import validate_vision_bundle, validate_vision_metadata, load_vision
     from tinygrad.llm.multimodal import ImageLimits
-    validate_vision_bundle(Path(args.vision_dir), model_path)
+    verified = validate_vision_bundle(Path(args.vision_dir), model_path)
     image_limits = ImageLimits(max_pixels=args.image_max_pixels, max_images=args.max_images, max_visual_tokens=args.max_visual_tokens)
   with Context(DEBUG=max(DEBUG.value, 2 if args.serve else 0)):
     model, kv = Transformer.from_gguf(model_path, args.max_context)
@@ -194,7 +198,7 @@ def main():
 
   # use the model's chat template if jinja2 is available (enables model-specific formatting)
   template: jinja2.Template|FallbackTemplate = FallbackTemplate(tok)
-  ct = (Path(args.vision_dir)/"chat_template.jinja").read_text() if args.vision_dir else kv.get('tokenizer.chat_template')
+  ct = verified["chat_template.jinja"].decode("utf-8") if args.vision_dir else kv.get('tokenizer.chat_template')
   if not args.no_chat_template and ct is not None:
     try:
       import jinja2

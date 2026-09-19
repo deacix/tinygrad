@@ -134,13 +134,18 @@ BUNDLE_FILES = {
 }
 GGUF_DIGEST = (15705861088, "9fd40d7036f5e0918e20aaeebf11468fafd06bb53d4d980eef6bb7e4e4ace666")
 
-def _verify_file(path:Path, spec:tuple[int,str]) -> None:
+def _verify_file(path:Path, spec:tuple[int,str]) -> bytes:
   size, digest = spec
   if not path.is_file() or path.stat().st_size != size: raise ValueError(f"missing or incorrect bundle file: {path.name}")
-  hasher = hashlib.sha1(f"blob {size}\0".encode()) if len(digest) == 40 else hashlib.sha256()
+  small = len(digest) == 40
+  hasher = hashlib.sha1(f"blob {size}\0".encode()) if small else hashlib.sha256()
+  retained = []
   with path.open("rb") as stream:
-    while chunk := stream.read(1024*1024): hasher.update(chunk)
+    while chunk := stream.read(1024*1024):
+      hasher.update(chunk)
+      if small: retained.append(chunk)
   if hasher.hexdigest() != digest: raise ValueError(f"bundle digest mismatch: {path.name}")
+  return b"".join(retained)
 
 def _bundle_paths(model_dir:Path) -> dict[str,Path]:
   root = model_dir.resolve(strict=True)
@@ -161,19 +166,21 @@ def _validate_visual_index(index:dict) -> None:
   actual = {k.removeprefix("model.visual."):v for k,v in index["weight_map"].items() if k.startswith("model.visual.")}
   if set(actual) != _visual_keys() or set(actual.values()) != {VISION_SHARD}: raise ValueError("unsupported visual tensor index")
 
-def _validate_vision_files(model_dir:Path) -> dict[str,Path]:
+def _validate_vision_files(model_dir:Path) -> tuple[dict[str,Path],dict[str,bytes]]:
   paths = _bundle_paths(model_dir)
-  for name, spec in BUNDLE_FILES.items(): _verify_file(paths[name], spec)
-  cfg = json.loads(paths["config.json"].read_bytes())
+  verified = {name:_verify_file(paths[name], spec) for name,spec in BUNDLE_FILES.items()}
+  cfg = json.loads(verified["config.json"])
   if (cfg.get("architectures") != ["Qwen3_5ForConditionalGeneration"] or cfg.get("model_type") != "qwen3_5" or
       cfg.get("language_model_only") is not False or VisionConfig.from_dict(cfg["vision_config"]) != VisionConfig() or
       cfg["text_config"]["hidden_size"] != 5120): raise ValueError("unsupported Qwen vision bundle configuration")
-  _validate_visual_index(json.loads(paths["model.safetensors.index.json"].read_bytes()))
-  return paths
+  _validate_visual_index(json.loads(verified["model.safetensors.index.json"]))
+  return paths, verified
 
-def validate_vision_bundle(model_dir:Path, gguf_path:Path) -> None:
+def validate_vision_bundle(model_dir:Path, gguf_path:Path) -> dict[str,bytes]:
+  # Large mapped weights must remain on protected/immutable storage throughout loading and inference.
+  # Retain small metadata bytes so parsing and template execution never reopen replaceable pathnames.
   _verify_file(gguf_path.resolve(strict=True), GGUF_DIGEST)
-  _validate_vision_files(model_dir)
+  return _validate_vision_files(model_dir)[1]
 
 def validate_vision_metadata(kv:dict) -> None:
   expected = {"general.architecture":"qwen35", "qwen35.block_count":64, "qwen35.embedding_length":5120,
@@ -186,7 +193,7 @@ def validate_vision_metadata(kv:dict) -> None:
     if len(tokens) <= index or tokens[index] != token: raise ValueError("GGUF vision token mismatch")
 
 def load_vision(model_dir:Path, *, device:str) -> QwenVision:
-  paths = _validate_vision_files(model_dir)
+  paths, _ = _validate_vision_files(model_dir)
   tensors = nn.state.safe_load(paths[VISION_SHARD])
   selected = {k.removeprefix("model.visual."):v for k,v in tensors.items() if k.startswith("model.visual.")}
   if set(selected) != _visual_keys(): raise ValueError("unexpected visual checkpoint keys")

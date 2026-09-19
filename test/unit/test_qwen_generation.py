@@ -87,6 +87,23 @@ class TestQwenMRope(unittest.TestCase):
 
 
 class TestQwenGenerate(unittest.TestCase):
+  def test_temperature_is_runtime_decode_input(self):
+    from tinygrad import UOp
+    model = make_model()
+    def logits(x, start_pos, position_ids=None):
+      # Preserve all JIT tensor inputs while making stochastic sampling independently predictable.
+      return Tensor([[0., 1.]], device=x.device) + x.sum()*0 + position_ids.sum()*0 + Tensor(start_pos, device=x.device)*0
+    uniform = Tensor([[0.9, 0.1]], device=model.token_embd.weight.device).realize()
+    tokens = Tensor([[1]], dtype=dtypes.int32, device=uniform.device).realize()
+    coords = Tensor([[[0]]]*3, dtype=dtypes.int32, device=uniform.device).realize()
+    temp = Tensor([0.1], device=uniform.device).realize()
+    physical = UOp.variable("start_pos",0,model.max_context-1).bind(0)
+    with patch.object(model,"forward_embeddings",logits), patch.object(Tensor,"rand_like",return_value=uniform):
+      for value, expected in ((0.1,1),(0.1,1),(10.,0),(0.1,1),(10.,0)):
+        temp.assign(Tensor([value],device=uniform.device)).realize()
+        self.assertEqual(model.multimodal_rollout_jit(tokens,physical,coords,temp).item(),expected)
+    self.assertGreaterEqual(model.multimodal_rollout_jit.cnt,5)
+
   def test_chunk_partitions_and_decode_replay(self):
     model = make_model(context=96)
     inputs = image_inputs(model, prefix=28)
@@ -252,7 +269,8 @@ class TestQwenGenerate(unittest.TestCase):
              {"position_ids":pos.cast(dtypes.int64)}, {"position_ids":pos[:, 0]}, {"position_ids":pos.to("CPU:1")},
              {"inputs_embeds":x.to("CPU:1")}, {"inputs_embeds":x*float("nan")}, {"position_ids":pos-1},
              {"rope_delta":-100}, {"rope_delta":2**31}, {"rope_delta":1.5}, {"rope_delta":delta+1}, {"chunk_size":0},
-             {"temperature":float("nan")}, {"temperature":float("inf")}, {"temperature":-1}]
+             {"temperature":float("nan")}, {"temperature":float("inf")}, {"temperature":-1},
+             {"temperature":10**400}, {"temperature":True}]
     for bad in cases:
       with self.subTest(bad=list(bad)), patch.object(model, "forward_embeddings") as forward:
         model._cached_tokens = [1, 2]

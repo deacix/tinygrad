@@ -201,6 +201,37 @@ class TestQwenCLI(unittest.TestCase):
                  ["--vision-dir", "x", "--image-max-pixels", "3"]):
       with self.subTest(argv=argv), self.assertRaises(SystemExit): parse_args(argv)
 
+  def test_cli_compiles_retained_verified_template(self):
+    import contextlib, tempfile
+    from unittest.mock import Mock, patch
+    from tinygrad.llm import cli
+    import jinja2
+    from tinygrad import Tensor
+    with tempfile.TemporaryDirectory() as tmp:
+      template_path = Path(tmp)/"chat_template.jinja"
+      template_path.write_text("initial")
+      def replace_template(*args, **kwargs):
+        template_path.write_text("unverified replacement")
+        return Mock()
+      model = Mock()
+      model.blk = []
+      model.token_embd.weight.device = "CPU"
+      model.max_context = 32
+      tokenizer = Mock(bos_id=None, eos_id=0)
+      tokenizer.decode.return_value = "end"
+      with patch.object(cli,"parse_args",return_value=cli.parse_args(["--vision-dir",tmp,"--serve"])), \
+           patch.object(cli,"fetch",return_value=Path(tmp)/"model.gguf"), \
+           patch("tinygrad.llm.vision.validate_vision_bundle",return_value={"chat_template.jinja":b"verified bytes"}), \
+           patch("tinygrad.llm.vision.validate_vision_metadata"), patch("tinygrad.llm.vision.load_vision",side_effect=replace_template), \
+           patch.object(cli.Transformer,"from_gguf",return_value=(model,{})), \
+           patch.object(cli.nn.state,"get_parameters",return_value=[Tensor.zeros(1)]), \
+           patch.object(cli,"SimpleTokenizer",return_value=tokenizer), patch.object(cli,"LLMServer") as server, \
+           patch.object(jinja2.Environment,"from_string",autospec=True) as compile_template, \
+           patch("builtins.input",side_effect=EOFError), contextlib.redirect_stdout(io.StringIO()):
+        cli.main()
+      self.assertEqual(compile_template.call_args.args[1],"verified bytes")
+      server.return_value.serve_forever.assert_called_once()
+
   def test_cli_local_image_canonical(self):
     from PIL import Image
     import tempfile
