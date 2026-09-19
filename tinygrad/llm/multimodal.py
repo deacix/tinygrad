@@ -2,6 +2,7 @@ from __future__ import annotations
 import base64, binascii, copy, io, json, math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from pathlib import Path
 from tinygrad import Tensor, dtypes
 if TYPE_CHECKING:
   from tinygrad.llm.cli import SimpleTokenizer
@@ -48,6 +49,16 @@ def image_size(height:int, width:int, limits:ImageLimits) -> tuple[int, int]:
   if not limits.min_pixels <= h*w <= limits.max_pixels: raise ImageInputError("image cannot fit the resized pixel budget", 413)
   if h*w//1024 > limits.max_visual_tokens: raise ImageInputError("image exceeds visual token budget", 413)
   return h, w
+
+def local_image_url(path:Path, limits:ImageLimits) -> str:
+  """CLI-only ingress; HTTP never resolves a path."""
+  if not path.is_file() or path.stat().st_size > limits.max_image_bytes: raise ImageInputError("invalid local image size", 413)
+  with path.open("rb") as stream: raw = stream.read(limits.max_image_bytes+1)
+  if len(raw) > limits.max_image_bytes: raise ImageInputError("image byte budget exceeded", 413)
+  if raw.startswith(b"\x89PNG\r\n\x1a\n"): mime = "png"
+  elif raw.startswith(b"\xff\xd8\xff"): mime = "jpeg"
+  else: raise ImageInputError("local image must be PNG or JPEG")
+  return f"data:image/{mime};base64," + base64.b64encode(raw).decode("ascii")
 
 def preprocess_image(url:str, limits:ImageLimits):
   """Decode bounded PNG/JPEG data into host float32 patches in Qwen's block-major order."""
@@ -129,7 +140,7 @@ def image_positions(tokens:tuple[int,...], grids:tuple[tuple[int,int,int],...], 
   return positions, int(positions.max())+1-len(tokens)
 
 def prepare_prompt(messages:list[dict], tokenizer:SimpleTokenizer, template, *, limits:ImageLimits, device:str,
-                   tools:list[dict]|None=None, template_kwargs:dict|None=None) -> PreparedPrompt:
+                   tools:list[dict]|None=None, template_kwargs:dict|None=None, max_context:int|None=None) -> PreparedPrompt:
   import numpy as np
   messages, tools = copy.deepcopy(messages), copy.deepcopy(tools)
   if not isinstance(messages, list) or not messages: raise ImageInputError("messages must be a nonempty array")
@@ -156,6 +167,9 @@ def prepare_prompt(messages:list[dict], tokenizer:SimpleTokenizer, template, *, 
       if part.get("type") == "text":
         if not isinstance(part.get("text"), str): raise ImageInputError("text part must contain a string")
         if any(marker in part["text"] for marker in MEDIA_MARKERS): raise ImageInputError("literal media markers are not allowed")
+        text = part["text"]
+        part.clear()
+        part.update({"type":"text", "text":text})
       elif part.get("type") == "image_url":
         if msg["role"] != "user": raise ImageInputError("images are supported only in user messages")
         if len(grids) >= limits.max_images: raise ImageInputError("image count limit exceeded", 413)
@@ -176,12 +190,17 @@ def prepare_prompt(messages:list[dict], tokenizer:SimpleTokenizer, template, *, 
       if isinstance(args, str):
         try: tc["function"]["arguments"] = json.loads(args)
         except json.JSONDecodeError: pass
-  rendered = template.render(messages=messages, tools=tools, add_generation_prompt=True, **options)
-  if rendered.count(IMAGE_MARKER) != len(grids): raise ImageInputError("template image count does not match payloads")
+  try: rendered = template.render(messages=messages, tools=tools, add_generation_prompt=True, **options)
+  except Exception as exc: raise ImageInputError(f"chat template rejected the messages ({type(exc).__name__})") from None
+  marker_run = "<|vision_start|>"+IMAGE_MARKER+"<|vision_end|>"
+  without_images = rendered.replace(marker_run, "")
+  if rendered.count(marker_run) != len(grids) or any(marker in without_images for marker in MEDIA_MARKERS):
+    raise ImageInputError("template media markers do not match payloads")
   pieces = rendered.split(IMAGE_MARKER)
   expanded = pieces[0]
   for i, (_,h,w) in enumerate(grids): expanded += IMAGE_MARKER*(h*w//4) + pieces[i+1]
   tokens = tuple(tokenizer.encode(expanded))
+  if max_context is not None and len(tokens) >= max_context: raise ImageInputError("expanded prompt exceeds model context")
   if not grids: return PreparedPrompt(tokens, starts_reasoning=rendered.rstrip().endswith("<think>"))
   spans, cursor = [], 0
   for _,h,w in grids:

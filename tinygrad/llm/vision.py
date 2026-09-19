@@ -64,9 +64,14 @@ class VisionAttention:
       start = end
     return self.proj(out[0].cat(*out[1:], dim=0))
 
+class VisionLayerNorm(nn.LayerNorm):
+  def __call__(self, x:Tensor) -> Tensor:
+    assert self.weight is not None and self.bias is not None
+    return (x.float().layernorm(axis=self.axis, eps=self.eps)*self.weight.float()+self.bias.float()).cast(x.dtype)
+
 class VisionBlock:
   def __init__(self, config:VisionConfig):
-    self.norm1, self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6), nn.LayerNorm(config.hidden_size, eps=1e-6)
+    self.norm1, self.norm2 = VisionLayerNorm(config.hidden_size, eps=1e-6), VisionLayerNorm(config.hidden_size, eps=1e-6)
     self.attn = VisionAttention(config)
     self.mlp = VisionMLP(config.hidden_size, config.intermediate_size, config.hidden_size)
   def __call__(self, x:Tensor, grids:tuple[tuple[int,int,int],...], rotary:Tensor) -> Tensor:
@@ -76,7 +81,7 @@ class VisionBlock:
 class VisionMerger(VisionMLP):
   def __init__(self, config:VisionConfig):
     super().__init__(config.hidden_size*4, config.hidden_size*4, config.out_hidden_size, exact=True)
-    self.norm = nn.LayerNorm(config.hidden_size, eps=1e-6)
+    self.norm = VisionLayerNorm(config.hidden_size, eps=1e-6)
   def __call__(self, x:Tensor) -> Tensor: return super().__call__(self.norm(x).reshape(x.shape[0]//4, -1))
 
 class QwenVision:

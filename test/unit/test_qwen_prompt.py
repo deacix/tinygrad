@@ -65,6 +65,26 @@ class TestQwenPrompt(unittest.TestCase):
     with self.assertRaises(ImageInputError):
       prepare_prompt(messages, MarkerTokenizer(), Mock(render=lambda **kw:"text only"), limits=ImageLimits(), device="CPU")
 
+  def test_prompt_rejects_context_before_transfer(self):
+    from tinygrad.llm.multimodal import ImageLimits, ImageInputError, prepare_prompt
+    from unittest.mock import patch
+    _, messages, template = self.setup_prompt()
+    with patch("tinygrad.llm.multimodal.image_positions", side_effect=AssertionError("allocated positions")):
+      with self.assertRaisesRegex(ImageInputError, "context"):
+        prepare_prompt(messages, MarkerTokenizer(), template, limits=ImageLimits(), device="CPU", max_context=3)
+
+  def test_prompt_canonical_text_and_template_errors(self):
+    from tinygrad.llm.multimodal import ImageLimits, ImageInputError, prepare_prompt
+    _, _, template = self.setup_prompt()
+    def prepare(content):
+      return prepare_prompt([{"role":"user", "content":content}], MarkerTokenizer(), template, limits=ImageLimits(), device="CPU")
+    plain = prepare([{"type":"text", "text":"hi"}])
+    sneaky = prepare([{"type":"text", "text":"hi", "video":True}])
+    self.assertEqual(plain.tokens, sneaky.tokens)
+    with self.assertRaises(ImageInputError): prepare([{"type":"text", "text":"<|video_"}, {"type":"text", "text":"pad|>"}])
+    with self.assertRaises(ImageInputError):
+      prepare_prompt([{"role":"system", "content":"only system"}], MarkerTokenizer(), template, limits=ImageLimits(), device="CPU")
+
   def test_prompt_fusion_replaces_image_embeddings(self):
     from tinygrad.llm.multimodal import PreparedPrompt, embed_prompt, IMAGE_TOKEN_ID
     # Real embedding table, mock only the already-tested encoder to isolate substitution.

@@ -38,6 +38,18 @@ class TestQwenVision(unittest.TestCase):
     separate = np.concatenate([model(pixels[:24], grids[:1]).numpy(), model(pixels[24:], grids[1:]).numpy()])
     np.testing.assert_allclose(together, separate, **manifest["parity_tiers"]["hf_fp32_algebra"]["tolerance"])
 
+  def test_vision_bfloat16_layernorm(self):
+    import torch
+    from tinygrad import dtypes
+    from tinygrad.llm.vision import VisionLayerNorm
+    x = np.array([[256.,258.,256.,258.]], dtype=np.float32)
+    norm = VisionLayerNorm(4, eps=1e-6)
+    norm.weight = Tensor.ones(4).cast(dtypes.bfloat16).realize()
+    norm.bias = Tensor.zeros(4).cast(dtypes.bfloat16).realize()
+    actual = norm(Tensor(x).cast(dtypes.bfloat16).realize()).float().numpy()
+    expected = torch.nn.functional.layer_norm(torch.tensor(x).bfloat16(), (4,), eps=1e-6).float().numpy()
+    np.testing.assert_array_equal(actual, expected)
+
   def test_vision_rejects_bad_grids(self):
     model, _, a = self.make_model()
     for grids in ((), ((2, 4, 6),), ((1, 3, 16),), ((1, 0, 48),), ((1, 4, 6),)):
