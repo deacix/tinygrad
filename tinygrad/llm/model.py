@@ -3,7 +3,8 @@ import enum, functools, itertools, math, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.gguf import gguf_load
+from tinygrad.llm.gguf import gguf_load, GGUFIndex, index_gguf, load_gguf_tensor
+from tinygrad.llm.placement import LayerPlacement, _placement_manifest
 from tinygrad.uop.ops import resolve
 
 class ExpertGating(enum.IntEnum):
@@ -92,6 +93,89 @@ class TransformerConfig:
   qkv_bias: bool = False
   expert_bias: bool = False
   rope_sections: tuple[int, ...] = (11, 11, 10)
+
+def _llama_parameter_shapes(config:TransformerConfig) -> dict[str, tuple[int, ...]]:
+  d, h, k = config.dim, config.hidden_dim, config.n_kv_heads*config.head_dim
+  shapes = {'token_embd.weight':(config.vocab_size,d), 'output_norm.weight':(d,), 'output.weight':(config.vocab_size,d)}
+  block = {'attn_norm':(d,), 'ffn_norm':(d,), 'attn_q':(d,d), 'attn_k':(k,d), 'attn_v':(k,d), 'attn_output':(d,d),
+           'ffn_gate':(h,d), 'ffn_up':(h,d), 'ffn_down':(d,h)}
+  shapes.update((f'blk.{i}.{name}.weight', shape) for i in range(config.num_blocks) for name,shape in block.items())
+  return shapes
+
+
+def preflight_placement(index:GGUFIndex, placement:LayerPlacement, *, max_context:int|None=None,
+                        realize:bool=False) -> tuple[TransformerConfig, LayerPlacement]:
+  """Validate the entire dense-Llama configuration/manifest without Tensors, payload reads or device opening.
+
+  Consumes the checked local-path index. Returns config with effective context and canonical placement, suitable
+  for metadata-only accounting. Unknown Llama computation fields fail closed; descriptive/tokenizer metadata is retained.
+  """
+  if realize: raise ValueError('explicit placement requires REALIZE=0')
+  kv = index.kv
+  if kv.get('general.architecture') != 'llama': raise ValueError('explicit placement supports only dense llama')
+  def positive_int(key:str, default=None) -> int:
+    value = kv.get(key, default)
+    if type(value) is not int or value <= 0: raise ValueError(f'{key} must be a positive integer')
+    return value
+  def positive_float(key:str) -> float:
+    value = kv.get(key, 0)
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+      raise ValueError(f'{key} must be finite and positive')
+    return float(value)
+  blocks = positive_int('llama.block_count')
+  placement = placement.validate(blocks)
+  dim, hidden = positive_int('llama.embedding_length'), positive_int('llama.feed_forward_length')
+  heads = positive_int('llama.attention.head_count')
+  kv_heads = positive_int('llama.attention.head_count_kv', heads)
+  head_dim = positive_int('llama.attention.key_length', dim//heads)
+  rope_dim = positive_int('llama.rope.dimension_count', head_dim)
+  value_dim = positive_int('llama.attention.value_length', head_dim)
+  if dim != heads*head_dim or head_dim != rope_dim or head_dim != value_dim or rope_dim % 2 or heads % kv_heads:
+    raise ValueError('placement requires full even-head RoPE, dim=heads*head_dim, equal Q/K/V head dimensions and divisible GQA')
+  context = positive_int('llama.context_length')
+  if max_context is not None:
+    if type(max_context) is not int or max_context <= 0: raise ValueError('max_context must be a positive integer')
+    context = min(context, max_context)
+  if placement.chunk_size > context: raise ValueError('chunk size must not exceed effective context')
+  tokens = kv.get('tokenizer.ggml.tokens')
+  if not isinstance(tokens, list) or not tokens or any(not isinstance(t, str) for t in tokens):
+    raise ValueError('tokenizer.ggml.tokens must be a nonempty string array')
+  if positive_int('llama.vocab_size', len(tokens)) != len(tokens): raise ValueError('vocabulary size disagrees with tokenizer')
+
+  # Reference dense computation only. Neutral settings are allowed explicitly, never through truthiness/coercion.
+  neutral = {'rope.scaling.type':'none', 'rope.scaling.factor':1.0, 'rope.scale_linear':1.0, 'rope.scaling.finetuned':False,
+             'tensor_data_layout':'reference', 'expert_count':0, 'expert_used_count':0, 'nextn_predict_layers':0,
+             'use_parallel_residual':False, 'attention.causal':True}
+  supported = {'block_count', 'embedding_length', 'feed_forward_length', 'context_length', 'vocab_size',
+               'attention.head_count', 'attention.head_count_kv', 'attention.key_length', 'attention.value_length',
+               'attention.layer_norm_rms_epsilon', 'rope.dimension_count', 'rope.freq_base'}
+  for key,value in kv.items():
+    if key in ('general.tensor_data_layout', 'llama.tensor_data_layout') and value != 'reference':
+      raise ValueError(f'unsupported placement metadata: {key}')
+    if not key.startswith('llama.'): continue
+    field = key[len('llama.'):]
+    if field in supported: continue
+    if field not in neutral: raise ValueError(f'unsupported placement computation metadata: {key}')
+    expected = neutral[field]
+    if (type(value) is not type(expected) and not (type(expected) is float and type(value) is int)) or value != expected:
+      raise ValueError(f'unsupported placement metadata value: {key}')
+  config = TransformerConfig(blocks, dim, hidden, heads, kv_heads, positive_float('llama.attention.layer_norm_rms_epsilon'), len(tokens),
+                             head_dim, positive_float('llama.rope.freq_base'), rope_dim, value_dim, max_context=context)
+  # Bound manifest expansion by the already bounded descriptor inventory, not a potentially enormous metadata count.
+  if not 2 + 9*blocks <= len(index.tensors) <= 4 + 9*blocks: raise ValueError('placed tensor count disagrees with block count')
+  shapes = _llama_parameter_shapes(config)
+  names = set()
+  for info in index.tensors:
+    if info.name in names: raise ValueError(f'duplicate placed tensor: {info.name}')
+    names.add(info.name)
+    if info.ggml_type not in (0,1,30,2,8,12,13,14): raise ValueError(f'unsupported placed GGML type for {info.name}: {info.ggml_type}')
+    shape = (rope_dim//2,) if info.name == 'rope_freqs.weight' else shapes.get(info.name)
+    if shape is None: raise ValueError(f'unsupported placed tensor: {info.name}')
+    if info.shape != shape: raise ValueError(f'placed tensor shape mismatch: {info.name}: {info.shape} != {shape}')
+  missing = shapes.keys() - names - {'output.weight'}
+  if missing: raise ValueError(f'missing placed tensors: {sorted(missing)}')
+  return config, placement
+
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -368,17 +452,51 @@ class GatedDeltaNetBlock(FFNBlock):
       self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device).clone()
 
+def _shape_only_llama(config:TransformerConfig) -> tuple[list[FFNBlock], nn.Embedding, nn.RMSNorm, Linear]:
+  # nn.Linear/Embedding call Tensor.rand, which allocates RNG seed/counter storage even without weight realization.
+  # Bypass those initializers locally, not via global monkeypatches. All placeholders are unrealized host buffers.
+  def norm(dim:int) -> nn.RMSNorm:
+    layer = nn.RMSNorm(dim, config.norm_eps, elementwise_affine=False)
+    layer.weight = Tensor.empty(dim, device='PYTHON')
+    return layer
+  def linear(out_features:int, in_features:int) -> Linear:
+    layer = Linear.__new__(Linear)
+    layer.in_features, layer.out_features, layer.bias = in_features, out_features, None
+    layer.use_custom_quant = False
+    layer.weight = Tensor.empty(out_features, in_features, device='PYTHON')
+    return layer
+  blocks:list[FFNBlock] = []
+  for _ in range(config.num_blocks):
+    block = TransformerBlock.__new__(TransformerBlock)
+    block.config = config
+    blocks.append(block)
+  for name,shape in _llama_parameter_shapes(config).items():
+    if name.startswith('blk.'):
+      _, index, component, _ = name.split('.')
+      setattr(blocks[int(index)], component, norm(shape[0]) if len(shape) == 1 else linear(*shape))
+  embedding = nn.Embedding.__new__(nn.Embedding)
+  embedding.weight = Tensor.empty(config.vocab_size, config.dim, device='PYTHON')
+  return blocks, embedding, norm(config.dim), linear(config.vocab_size, config.dim)
+
+
 class Transformer:
-  def __init__(self, config:TransformerConfig):
-    dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
-    if config.ssm: config = replace(config, qk_norm=config.head_dim)
-    block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
-    self.blk:list[FFNBlock] = [GatedDeltaNetBlock(dense_config if i < config.leading_dense_blocks else config, config.ssm)
-                               if config.ssm and config.ssm_layers[i] else
-                               block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
-    self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
-    self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
-    self.output = Linear(config.dim, config.vocab_size, bias=False)
+  placement: LayerPlacement  # present only for explicit placed loading
+
+  def __init__(self, config:TransformerConfig, *, _shape_only:bool=False):
+    self.blk:list[FFNBlock]
+    if _shape_only:
+      self.blk, self.token_embd, self.output_norm, self.output = _shape_only_llama(config)
+    else:
+      dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0,
+                             hidden_dim=config.dense_hidden_dim or config.hidden_dim)
+      if config.ssm: config = replace(config, qk_norm=config.head_dim)
+      block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
+      self.blk = [GatedDeltaNetBlock(dense_config if i < config.leading_dense_blocks else config, config.ssm)
+                                 if config.ssm and config.ssm_layers[i] else
+                                 block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
+      self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
+      self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
+      self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
@@ -421,7 +539,35 @@ class Transformer:
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
-                realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
+                realize=bool(getenv("REALIZE", 0)), *, placement:LayerPlacement|None=None) -> tuple[Transformer, dict]:
+    if placement is not None:
+      if not isinstance(gguf, (str, pathlib.Path)): raise TypeError('explicit placement requires a local GGUF path')
+      if isinstance(gguf, str) and '://' in gguf: raise ValueError('explicit placement requires a local GGUF path, not a URL')
+      if realize: raise ValueError('explicit placement requires REALIZE=0')
+      index = index_gguf(gguf)
+      config, placement = preflight_placement(index, placement, max_context=max_context, realize=realize)
+      manifest = _placement_manifest(index, placement)
+      model = Transformer(config, _shape_only=True)
+      parameters = nn.state.get_state_dict(model)
+      # Check construction against the complete validated manifest before the very first payload transfer.
+      if parameters.keys() != {name for name,_,_ in manifest} or any(parameters[n].shape != info.shape for n,info,_ in manifest):
+        raise ValueError('placed model construction disagrees with GGUF manifest')
+      model.placement = placement
+      loaded:dict[tuple[int, int, int, str], Tensor] = {}
+      for name,info,owner in manifest:
+        key = (info.part, info.offset, info.nbytes, owner)
+        if key not in loaded:
+          weight = load_gguf_tensor(index, info, device=owner)
+          if getenv('HALF', 1): weight = weight.half()
+          # Full-head Llama RoPE: interleaved rows to half-split, matching the legacy Q/K transforms below.
+          if name.endswith(('attn_q.weight', 'attn_k.weight')):
+            heads = config.n_heads if name.endswith('attn_q.weight') else config.n_kv_heads
+            weight = weight.reshape(heads, config.head_dim, config.dim).rearrange('n (h two) d -> n (two h) d', two=2).reshape(info.shape)
+          loaded[key] = weight
+        if loaded[key].device != owner: raise ValueError(f'placed tensor is not on its owner: {name}')
+        parameters[name].replace(loaded[key])
+      return model, index.kv
+
     # TODO: remove the need for copy to default device
     kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
 
