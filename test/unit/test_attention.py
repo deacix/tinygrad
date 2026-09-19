@@ -114,14 +114,7 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     return block._attention(x_norm, start_pos).realize().numpy()
 
   def _cache_views(self, block:GatedDeltaNetBlock) -> tuple[np.ndarray, np.ndarray]:
-    if hasattr(block, 'conv_state'):
-      return block.conv_state.numpy(), block.recurrent_state.numpy()
-    else:
-      conv_flat = (block.ssm_conv_kernel - 1) * block.conv_channels
-      cache = block.delta_cache.numpy()
-      conv_state = cache[:, :conv_flat].reshape(cache.shape[0], block.ssm_conv_kernel - 1, block.conv_channels)
-      recurrent_state = cache[:, conv_flat:].reshape(cache.shape[0], block.num_v_heads, block.head_v_dim, block.head_v_dim)
-      return conv_state, recurrent_state
+    return block.conv_state.numpy(), block.recurrent_state.numpy()
 
   def _reset_state(self, block:GatedDeltaNetBlock):
     Tensor.realize(block.conv_state.assign(block.conv_state.const_like(0)),
@@ -135,7 +128,9 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     return (x_float / np.sqrt((x_float * x_float).mean(axis=-1, keepdims=True) + eps)) * weight.astype(np.float32)
 
   def _normalize_np(self, x:np.ndarray, eps:float=1e-6) -> np.ndarray:
-    return x / np.maximum(np.sqrt((x * x).sum(axis=-1, keepdims=True)), eps)
+    # Qwen3.5/3.8 HF l2norm (FLA): epsilon is INSIDE rsqrt, not a clamp on the norm.
+    # The old oracle repeated the native clamp formula and hid low-norm GDN errors. KDA keeps its own normalize.
+    return x / np.sqrt((x * x).sum(axis=-1, keepdims=True) + eps)
 
   def _softplus_np(self, x:np.ndarray) -> np.ndarray:
     return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0)
@@ -147,7 +142,7 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     x_np = x.numpy().astype(np.float32)
     B, T, _ = x_np.shape
     conv_state = np.zeros((B, block.ssm_conv_kernel - 1, block.conv_channels), dtype=np.float32)
-    recurrent_state = np.zeros((B, block.num_v_heads, block.head_v_dim, block.head_v_dim), dtype=np.float32)
+    recurrent_state = np.zeros((B, block.num_v_heads, block.head_v_dim, block.head_k_dim), dtype=np.float32)
     conv_weight = block.ssm_conv1d["weight"].numpy().astype(np.float32).T[None, :, :]
     qkv_weight = block.attn_qkv.weight.numpy().astype(np.float32)
     gate_weight = block.attn_gate.weight.numpy().astype(np.float32)
@@ -189,6 +184,27 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
       recurrent_states.append(recurrent_state.copy())
 
     return outputs, conv_states, recurrent_states
+
+  def test_gatedeltanet_low_norm_rectangular_heads(self):
+    config = self._make_config(max_context=8,
+      ssm=SSMConfig(conv_kernel=4, state_size=4, group_count=2, time_step_rank=6, inner_size=36))
+    block = self._make_block(config)
+    rng = np.random.default_rng(20260919)
+    # Distinguishable Q/K heads (not collinear linspaces); low post-convolution norms expose epsilon placement.
+    block.attn_qkv.weight = Tensor(rng.uniform(-0.01, 0.01, (52, config.dim)).astype(np.float32))
+    x = Tensor(rng.uniform(-1, 1, (1, 5, config.dim)).astype(np.float32))
+    outputs, conv, recurrent = self._naive_attention(block, x)
+    self.assertEqual(recurrent[-1].shape, (1, 6, 6, 4))
+    self.assertGreater(np.abs(recurrent[-1][:, 0] - recurrent[-1][:, 1]).max(), 1e-6)
+    for lengths in ([5], [1]*5, [2, 3], [3, 1, 1]):
+      start = 0
+      for length in lengths:
+        actual = self._run_attention(block, x[:, start:start+length], start)
+        end = start + length
+        np.testing.assert_allclose(actual, np.concatenate(outputs[start:end], axis=1), rtol=1e-4, atol=1e-5)
+        np.testing.assert_allclose(block.conv_state.numpy(), conv[end-1], rtol=1e-4, atol=1e-5)
+        np.testing.assert_allclose(block.recurrent_state.numpy(), recurrent[end-1], rtol=1e-4, atol=1e-5)
+        start = end
 
   def test_gatedeltanet_reference_and_reset(self):
     config = self._make_config(max_context=3)
