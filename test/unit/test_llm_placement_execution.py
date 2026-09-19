@@ -154,6 +154,63 @@ class TestPlacedExecution:
     gc.collect()
     assert all(r() is None for r in refs+buffer_refs)
 
+  @pytest.mark.parametrize('counts', [(4,),(1,3)])
+  @pytest.mark.parametrize('warmup', [False,True])
+  def test_coordinator_uploads_retain_sources_until_sync(self,tmp_path,counts,warmup):
+    from contextlib import ExitStack
+    model, _ = load_pair(tmp_path,counts=counts,chunk=1)
+    last = model.placement.devices[-1]
+    logits = Tensor.zeros(1,32,device=last).contiguous().realize()
+    sampled = Tensor([[3]],dtype=dtypes.int32,device=last).realize()
+    pending, completed = [], []
+    copy, frompy, init = UOp.copy_to_device, UOp._frompy, Tensor.__init__
+    def construct(tensor,data,*args,**kwargs):
+      if isinstance(data,(list,tuple,bytes)):
+        assert kwargs.get('device') == 'PYTHON', 'coordinator must retain an explicit host source before uploading'
+      init(tensor,data,*args,**kwargs)
+    def capture(src,device,*args,**kwargs):
+      if src.device == 'PYTHON' and device in model.placement.devices:
+        roots = buffer_roots(Tensor(src))
+        assert len(roots) == 1
+        buf = next(iter(roots)).buffer
+        pending.append((device,weakref.ref(buf),bytes(buf.host)))
+      return copy(src,device,*args,**kwargs)
+    def allocate(*args,**kwargs):
+      assert not pending, 'new host allocation before preceding coordinator upload completed'
+      return frompy(*args,**kwargs)
+    def sync(device,original):
+      gc.collect()
+      for dst,ref,value in pending:
+        if dst == device:
+          assert ref() is not None, 'upload source was released before destination synchronization'
+          assert bytes(ref().host) == value
+      original()
+      completed.extend(value for dst,_,value in pending if dst == device)
+      pending[:] = [item for item in pending if item[0] != device]
+    def step(tokens,*args,**kwargs):
+      assert not pending, 'coordinator input was not synchronized before stage execution'
+      assert tokens.tolist() == [[3]] if not warmup else tokens.shape == (1,1)
+      return logits
+    def sample(_logits,temp):
+      assert not pending and temp.item() == 0.75
+      return sampled
+    with ExitStack() as stack:
+      for device in model.placement.devices:
+        original = Device[device].synchronize
+        stack.enter_context(patch.object(Device[device],'synchronize',lambda d=device,f=original: sync(d,f)))
+      stack.enter_context(patch.object(Tensor,'__init__',construct))
+      stack.enter_context(patch.object(UOp,'copy_to_device',capture))
+      stack.enter_context(patch.object(UOp,'_frompy',allocate))
+      stack.enter_context(patch.object(model,'_placed_step',step))
+      stack.enter_context(patch.object(model,'_placed_sample',sample))
+      if warmup: model.warmup()
+      else:
+        gen = model.generate([3],temperature=0.75)
+        try: assert next(gen) == 3
+        finally: gen.close()
+    assert not pending
+    assert completed == ([struct.pack('<i',i) for i in range(3)] if warmup else [struct.pack('<f',0.75),struct.pack('<i',3)])
+
   @pytest.mark.parametrize('length', [1,4,5,6,7,8,9,31,32])
   def test_generation_concrete_chunks_sample_only_final(self,tmp_path,length):
     model, ref = load_pair(tmp_path)

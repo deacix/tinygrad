@@ -9,6 +9,15 @@ from tinygrad.llm.gguf import gguf_load, GGUFIndex, index_gguf, load_gguf_tensor
 from tinygrad.llm.placement import LayerPlacement, _placement_manifest
 from tinygrad.uop.ops import resolve
 from tinygrad.device import Device
+from tinygrad.dtype import DType
+
+
+def _upload_placed_input(data:list, dtype:DType, destination:str) -> Tensor:
+  # Coordinator inputs may upload asynchronously too; hold the actual _frompy source, not just its Python values.
+  source = Tensor(data, dtype=dtype, device='PYTHON').realize()
+  out = source.to(destination).realize()
+  Device[destination].synchronize()
+  return out
 
 
 def _transfer_activation(x:Tensor, destination:str, mode:str) -> Tensor:
@@ -827,7 +836,7 @@ class Transformer:
         try:
           for count in dict.fromkeys((1, self._placed.placement.chunk_size)):
             for i in range(3):  # first eager, then capture, then replay
-              tokens = Tensor([[i % self._placed.config.vocab_size]*count], dtype=dtypes.int32, device=self._placed.placement.devices[0])
+              tokens = _upload_placed_input([[i % self._placed.config.vocab_size]*count], dtypes.int32, self._placed.placement.devices[0])
               self._placed_step(tokens, 0, owner=owner)
           for stage in self._placed.stages: Device[stage.device].synchronize()
         finally: self._cached_tokens = []
@@ -918,13 +927,13 @@ class Transformer:
     except OverflowError: valid_temperature = False
     if not valid_temperature: raise ValueError('temperature must be finite and nonnegative')
     with self._placed_transaction('generation') as owner:
-      temp = Tensor([temperature], dtype=dtypes.float32, device=self._placed.placement.devices[-1]).realize()
+      temp = _upload_placed_input([temperature], dtypes.float32, self._placed.placement.devices[-1])
       pos = self.get_start_pos(tokens)
       # Own the working history, so a caller mutating its list between yields cannot corrupt prefix metadata.
       history = tokens.copy()
       while len(history) < self.max_context:
         end = min(pos+chunk_size, len(history))
-        value = Tensor([history[pos:end]], dtype=dtypes.int32, device=self._placed.placement.devices[0]).realize()
+        value = _upload_placed_input([history[pos:end]], dtypes.int32, self._placed.placement.devices[0])
         logits = self._placed_step(value, pos, owner=owner)
         pos = end
         if pos < len(history): continue
