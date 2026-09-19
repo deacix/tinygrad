@@ -2,7 +2,7 @@ import unittest
 import numpy as np
 from tinygrad import Tensor, dtypes, nn
 from tinygrad.llm.model import (
-  GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig,
+  GatedDeltaNetBlock, SSMConfig, Transformer, TransformerBlock, TransformerConfig,
   apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk,
 )
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, amd_custom_kernels_supported
@@ -50,6 +50,22 @@ class TestAttention(unittest.TestCase):
 
     expected = apply_rope_new(k[..., :rope_dim], block.freqs_cis[:seqlen]).cat(k[..., rope_dim:], dim=-1)
     np.testing.assert_allclose(block.cache_kv[0, :, :, :seqlen, :].numpy(), expected.numpy(), rtol=1e-5, atol=1e-5)
+
+class TestEmbeddingLogits(unittest.TestCase):
+  def test_forward_embeddings_preserves_text_logits(self):
+    config = TransformerConfig(num_blocks=1, dim=8, hidden_dim=16, n_heads=2, n_kv_heads=1,
+                               norm_eps=1e-5, vocab_size=32, head_dim=4, rope_theta=10000.0,
+                               rope_dim=4, v_head_dim=4, max_context=16)
+    model = Transformer(config)
+    tokens = Tensor([[1, 3, 2]], dtype=dtypes.int32)
+    x = model.token_embd(tokens).float()
+    expected = x
+    for block in model.blk: expected = block(expected, 0)
+    expected = model.output(model.output_norm(expected[:, -1:]))[:, -1].realize()
+    actual = model.forward_embeddings(x, 0).realize()
+    np.testing.assert_array_equal(actual.numpy(), expected.numpy())
+    sampled = model.forward(tokens, 0, Tensor([0.0])).numpy()
+    np.testing.assert_array_equal(sampled, actual.argmax(-1, keepdim=True).numpy())
 
 class TestGatedDeltaNetBlock(unittest.TestCase):
   def test_gated_delta_rectangular_state_and_row_decay(self):
