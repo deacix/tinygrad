@@ -172,7 +172,9 @@ class Handler(VizHandler):
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages: raise ImageInputError("messages must be a nonempty array")
     for message in messages:
-      if not isinstance(message, dict) or message.get("role") not in ("system", "user", "assistant", "tool"):
+      # Text role semantics belong to its selected template (including developer/custom roles).
+      # Qwen-specific role restrictions are enforced by prepare_prompt when vision is enabled.
+      if not isinstance(message, dict) or not isinstance(message.get("role"), str) or not message["role"]:
         raise ImageInputError("invalid message role")
       content = message.get("content")
       if not isinstance(content, (str,list,type(None))): raise ImageInputError("invalid message content")

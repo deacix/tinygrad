@@ -65,6 +65,18 @@ class TestQwenHTTP(unittest.TestCase):
     self.assertEqual(json.loads(body)["choices"][0]["finish_reason"],"length")
     self.assertEqual(self.closed,[True])
 
+  def test_text_template_roles_are_preserved(self):
+    from tinygrad.llm.cli import FallbackTemplate
+    self.server.template = FallbackTemplate(Mock(preset="llama3", bos_id=None, eos_id=999, decode=lambda ids:""))
+    for role in ("developer", "custom_template_role"):
+      messages = [{"role":role, "content":"Answer briefly."}, {"role":"user", "content":"Hello"}]
+      status, body = self.request({"model":"test", "messages":messages, "max_tokens":1})
+      self.assertEqual(status,200)
+      self.assertEqual(json.loads(body)["choices"][0]["message"]["content"],"x")
+      self.assertIn(f"<|start_header_id|>{role}<|end_header_id|>",self.tok.encode.call_args.args[0])
+    for role in (None, 1, ""):
+      self.assertEqual(self.request({"model":"test", "messages":[{"role":role,"content":"hi"}]})[0],400)
+
   def test_text_server_operator_output_cap(self):
     self.server.max_output_tokens = 1
     for options in ({}, {"max_tokens":9}, {"max_completion_tokens":9}):
