@@ -1,6 +1,7 @@
 from __future__ import annotations
 import enum, functools, itertools, math, pathlib, threading
 from contextlib import contextmanager
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
@@ -621,16 +622,19 @@ class Transformer:
     """Synchronous availability check, including before a caller sends streaming headers."""
     if hasattr(self, '_placed'):
       if self._placed.state == 'failed': raise PlacedModelUnavailableError('placed model failed; reload required')
-      if self._placed.state != 'ready': raise PlacedModelBusyError('placed model is in use')
+      if self._placed.state != 'ready' or self._placed.lock.locked(): raise PlacedModelBusyError('placed model is in use')
 
   @contextmanager
-  def _placed_transaction(self, operation:str):
+  def _placed_transaction(self, operation:str, validate:Callable[[], None]|None=None):
     executor = self._placed
     if not executor.lock.acquire(blocking=False): raise PlacedModelBusyError('placed model is in use')
     try:
-      self.check_available()
+      if executor.state == 'failed': raise PlacedModelUnavailableError('placed model failed; reload required')
+      if executor.state != 'ready': raise PlacedModelBusyError('placed model is in use')
       if self.max_context != executor.config.max_context or any(b.config is not executor.config for b in self.blk):
         raise ValueError('placed configuration changed; reload required')
+      # Input readback must share admission's lock, but invalid values must not poison committed caches.
+      if validate is not None: validate()
       owner = object()
       executor.owner, executor.state = owner, 'generating'
       try: yield owner
@@ -660,11 +664,12 @@ class Transformer:
     self._placed_position(tokens, start_pos)
     if temperature.device != self._placed.placement.devices[-1] or temperature.shape != (1,) or temperature.dtype != dtypes.float32:
       raise ValueError('placed temperature must be FP32 [1] on the final owner')
-    with self._placed_operation(len(self._placed.stages)-1, 'input'): value = temperature.item()
-    if not math.isfinite(value) or value < 0: raise ValueError('temperature must be finite and nonnegative')
-    with self._placed_operation(0, 'input'): ids = list(tokens.flatten().data())
-    if any(not 0 <= t < self._placed.config.vocab_size for t in ids): raise ValueError('invalid placed token ID')
-    with self._placed_transaction('direct') as owner:
+    def validate():
+      with self._placed_operation(len(self._placed.stages)-1, 'input'): value = temperature.item()
+      if not math.isfinite(value) or value < 0: raise ValueError('temperature must be finite and nonnegative')
+      with self._placed_operation(0, 'input'): ids = list(tokens.flatten().data())
+      if any(not 0 <= t < self._placed.config.vocab_size for t in ids): raise ValueError('invalid placed token ID')
+    with self._placed_transaction('direct', validate) as owner:
       self._cached_tokens = []  # direct callers have no complete history contract, even on success
       return self._placed_sample(self._placed_step(tokens, start_pos, jit=jit, owner=owner), temperature)
 

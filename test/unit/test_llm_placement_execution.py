@@ -1,5 +1,5 @@
 """Mandatory CPU logical-device execution tests. No downloads or GPU availability skips."""
-import dataclasses, gc, struct, weakref
+import dataclasses, gc, struct, weakref, threading
 from unittest.mock import patch
 import numpy as np
 import pytest
@@ -275,7 +275,8 @@ class TestPlacedJit:
 
   @pytest.mark.parametrize('typ', [2,8,12,13,14])
   @pytest.mark.parametrize('counts', [(2,),(1,1)])
-  def test_packed_ties_replay_and_detached_roots(self,tmp_path,typ,counts):
+  @pytest.mark.parametrize('half,count', [(1,1),(1,4),(0,4)])
+  def test_packed_ties_replay_and_detached_roots(self,tmp_path,typ,counts,half,count):
     dim = 256 if typ in (12,13,14) else 32
     ts, kv, values = llama_fixture(dim=dim,blocks=2,typ=typ)
     scaled = []
@@ -295,16 +296,22 @@ class TestPlacedJit:
     path = tmp_path/'packed.gguf'
     path.write_bytes(build_gguf(scaled,kv))
     devices = ('CPU',) if len(counts) == 1 else ('CPU','CPU:1')
-    with patch.object(mm,'getenv',return_value=1):
+    with patch.object(mm,'getenv',return_value=half):
       model, _ = Transformer.from_gguf(path,placement=LayerPlacement(devices,counts,chunk_size=4))
-    ref = reference(values,dim=dim,blocks=2,half=1)
+    ref = reference(values,dim=dim,blocks=2,half=half)
     weights = {n:t for n,t in nn.state.get_state_dict(model).items() if n.endswith('.weight')}
     roots = {n:buffer_roots(t) for n,t in weights.items()}
     path.unlink()
     for step in range(4):
-      ids = [(step*3+7)%32]
-      actual = placed_logits(model,ids,step,jit=True)
-      assert_parity(model,ref,actual,ref_step(ref,ids,step),step+1,half=True)
+      ids = [(step*3+i*7+7)%32 for i in range(count)]
+      actual = placed_logits(model,ids,step*count,jit=True)
+      assert_parity(model,ref,actual,ref_step(ref,ids,step*count),(step+1)*count,half=True)
+    for stage in model._placed.stages:
+      assert (stage.single_jit if count == 1 else stage.chunk_jit).captured is not None
+    if count == 4:
+      actual = placed_logits(model,[3,11],16,jit=True)
+      assert_parity(model,ref,actual,ref_step(ref,[3,11],16),18,half=True)
+      assert all(s.chunk_jit.cnt == 4 and s.single_jit.cnt == 0 for s in model._placed.stages)
     assert {n:buffer_roots(t) for n,t in weights.items()} == roots
     assert roots['output.weight'] == roots['token_embd.weight'] if len(counts) == 1 else \
       roots['output.weight'].isdisjoint(roots['token_embd.weight'])
@@ -314,8 +321,72 @@ class TestPlacedJit:
       expected_name = 'token_embd.weight' if name == 'output.weight' else name
       assert root.buffer.nbytes == len(next(raw for n,_,_,raw in scaled if n == expected_name))
 
+class TestLegacyPublicPlacementIsolation:
+  def test_legacy_gguf_public_generation_chunk_defaults_and_prefix(self,tmp_path):
+    path, _ = save_llama(tmp_path,tied=False)
+    def load():
+      with patch.object(mm,'getenv',return_value=0): return Transformer.from_gguf(path,realize=False)[0]
+    def take(model,prompt,**kwargs):
+      gen = model.generate(prompt,**kwargs)
+      try: return [next(gen) for _ in range(4)]
+      finally: gen.close()
+    left, right = load(), load()
+    with patch.object(Transformer,'_placed_step',side_effect=AssertionError('placed dispatch in legacy')):
+      history = [3,1,9,7,2]
+      assert take(left,history) == take(right,[3,1,9,7,2],chunk_size=32)
+      assert left.prefill_jit.cnt > 0 and left.rollout_jit.cnt >= 3
+      assert left.get_start_pos(history+[4]) == len(history)-1
+      assert take(left,history+[4]) == take(load(),history+[4],chunk_size=32)
+      assert not hasattr(left,'placement')
+
 # Lifecycle tests use public entrypoints, never a private step to bypass ownership.
 class TestPlacedLifecycle:
+  def test_direct_admission_race_has_no_unowned_input_reads(self,tmp_path):
+    model, _ = load_pair(tmp_path)
+    tokens = Tensor([[3]],dtype=dtypes.int32,device='CPU').realize()
+    temp = Tensor([0.],dtype=dtypes.float32,device='CPU:1').realize()
+    checked, proceed = threading.Event(), threading.Event()
+    errors, unowned_reads = [], []
+    check, item = model.check_available, Tensor.item
+    def availability():
+      check()
+      if threading.current_thread() is thread:
+        checked.set()
+        assert proceed.wait(5)
+    def guarded_item(t):
+      if threading.current_thread() is thread and model._placed.owner is not None:
+        unowned_reads.append(t)
+      return item(t)
+    def direct():
+      try: model(tokens,0,temp)
+      except Exception as exc: errors.append(exc)
+    thread = threading.Thread(target=direct)
+    with patch.object(model,'check_available',availability), patch.object(Tensor,'item',guarded_item):
+      thread.start()
+      try:
+        assert checked.wait(5)
+        # A paused before admission must not read backend data while this owner is active.
+        if model._placed.lock.acquire(blocking=False):
+          try:
+            model._placed.owner, model._placed.state = object(), 'generating'
+            proceed.set()
+            thread.join(5)
+          finally:
+            model._placed.owner, model._placed.state = None, 'ready'
+            model._placed.lock.release()
+          assert len(errors) == 1 and isinstance(errors[0],mm.PlacedModelBusyError)
+          assert not unowned_reads
+        else:
+          # Admission was already atomic: our competitor fails before any mutation/read.
+          with pytest.raises(mm.PlacedModelBusyError): next(model.generate([4]))
+          proceed.set()
+          thread.join(5)
+          assert not errors
+      finally:
+        proceed.set()
+        thread.join(5)
+    assert not thread.is_alive() and model._placed.state == 'ready'
+
   def test_clean_close_competitors_and_reset(self,tmp_path):
     model, _ = load_pair(tmp_path)
     gen = model.generate([3,1,9,7,2])
