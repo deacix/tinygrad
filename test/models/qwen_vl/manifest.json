@@ -3285,8 +3285,8 @@
   "generator": {
     "path": "test/external/external_qwen_vl.py",
     "regenerate": "python test/external/external_qwen_vl.py --generate",
-    "reproducibility": "--check-reproducible regenerates and compares BOTH files byte-for-byte",
-    "sha256": "6dee5c408f80eb7df80c708ea2b8872001571869d727135741173f75c187bd89"
+    "reproducibility": "--check-reproducible requires exact array hashes, archive bytes and manifest identity; backend machine/python/zlib execution provenance is compared and reported separately",
+    "sha256": "d0b362e1c2d9459f8a6d0c2fc4ef2b824b2e8ad4eda0182849213ad5e2012a99"
   },
   "layouts": {
     "coordinates.*.position_ids": "3,1,L (T,H,W); physical spans exclude delimiters, official not small-vocab IDs",

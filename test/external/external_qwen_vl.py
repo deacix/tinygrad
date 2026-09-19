@@ -14,10 +14,18 @@ files. --verify needs only NumPy; regeneration needs the reference environment.
   python test/external/external_qwen_vl.py --phase text --synthetic
 
 Text phase uses tinygrad and the offline cast-tier fixtures (no reference install).
+  python test/external/external_qwen_vl.py --phase vision --synthetic
+Vision phase uses the pinned reference environment plus tinygrad for live full-tower
+BF16 parity with existing synthetic weights rounded to BF16, unequal image lengths
+and noninteger position interpolation. Reports max-absolute errors at rtol=atol=2e-2.
   python test/external/external_qwen_vl.py --phase fusion --synthetic
 Fusion phase uses the pinned reference environment plus tinygrad, reusing existing
 arrays for live complete synthetic vision/fusion/hybrid prefill and decode parity.
-Neither phase establishes full checkpoint, quantized or hardware acceptance.
+These phases do not establish full checkpoint, quantized or hardware acceptance.
+
+--check-reproducible requires exact numerical-array hashes, archive bytes and manifest
+identity, excluding only backend machine/Python/zlib execution provenance (reported
+separately). It never claims cross-platform numerical or zlib byte identity in advance.
 
   python test/external/external_qwen_vl.py --phase processor-compare
   python test/external/external_qwen_vl.py --phase e2e --model-dir PATH --gguf PATH --image-suite controlled
@@ -436,7 +444,8 @@ def generate(output, metadata_dir=None, archive_dir=ROOT):
     "rng": "NumPy PCG64 default_rng, sorted named_parameters; see initialize_weights; Torch seed fixes constructors only",
     "generator": {"path": "test/external/external_qwen_vl.py", "sha256": digest(Path(__file__).read_bytes()),
                   "regenerate": "python test/external/external_qwen_vl.py --generate",
-                  "reproducibility": "--check-reproducible regenerates and compares BOTH files byte-for-byte"},
+                  "reproducibility": "--check-reproducible requires exact array hashes, archive bytes and manifest identity; "
+                                     "backend machine/python/zlib execution provenance is compared and reported separately"},
     "configs": {"vision": VISION, "text": TEXT}, "processor": PROCESSOR, "processor_cases": cases,
     "processor_contract": {"class": "Qwen2VLImageProcessorPil", "backend": "pil", "input": "decoded RGB uint8 HWC",
                            "exif": "not exercised: synthetic RGB has no EXIF; policy belongs to B1",
@@ -507,6 +516,85 @@ def verify(directory):
     if not np.isfinite(a).all() or digest(a.tobytes(order="C")) != spec["sha256"]: raise ValueError(f"array digest mismatch: {name}")
   if deterministic_npz(arrays) != raw: raise ValueError("noncanonical NPZ archive")
   print(f"Verified {len(arrays)} arrays; npz sha256={digest(raw)}")
+
+def compare_reproduction(expected_dir, actual_dir):
+  """Identity is exact, not an allclose test; execution provenance is retained but is not identity."""
+  expected = json.loads((expected_dir / "manifest.json").read_text())
+  actual = json.loads((actual_dir / "manifest.json").read_text())
+  provenance = {}
+  for name, manifest in (("recorded", expected), ("regenerated", actual)):
+    provenance[name] = {key:manifest["backend"].pop(key) for key in ("machine", "python", "zlib")}
+  if expected["arrays"] != actual["arrays"]: raise ValueError("regeneration differs: numerical array hashes/schema (not execution provenance)")
+  if (expected_dir / "reference.npz").read_bytes() != (actual_dir / "reference.npz").read_bytes():
+    raise ValueError("regeneration differs: reference.npz bytes (array hashes match; check archive serialization/zlib)")
+  if expected != actual: raise ValueError("regeneration differs: manifest identity (excluding machine/python/zlib execution provenance)")
+  provenance["matching"] = provenance["recorded"] == provenance["regenerated"]
+  return {"numerical_array_hashes":"exact", "archive":"byte-for-byte", "manifest_identity":"exact excluding execution provenance",
+          "execution_provenance":provenance}
+
+
+def vision_phase(manifest, arrays):
+  """Live official BF16 full tower, no checkpoint and no patches to reference arithmetic."""
+  from tinygrad import Tensor, nn, dtypes, Device
+  from tinygrad.llm.vision import QwenVision, VisionConfig
+  torch, hf = reference_imports()
+  config = manifest["configs"]["vision"]
+  tolerance = {"rtol":2e-2, "atol":2e-2}
+  oracle = hf.Qwen3_5VisionModel(hf.Qwen3_5VisionConfig(**config, attn_implementation="eager")).eval().bfloat16()
+  state = {k.removeprefix("vision.weights."):torch.from_numpy(v).bfloat16() for k,v in arrays.items() if k.startswith("vision.weights.")}
+  oracle.load_state_dict(state, strict=True)
+  native = QwenVision(VisionConfig.from_dict(config))
+  # Transfer the same rounded values; materialize the BF16 storage before execution.
+  weights = {k:Tensor(v.float().numpy()).cast(dtypes.bfloat16).realize() for k,v in state.items()}
+  nn.state.load_state_dict(native, weights, verbose=False)
+  assert all(v.dtype == dtypes.bfloat16 for v in nn.state.get_parameters(native))
+  # A 5x5 learned position table interpolates at thirds/fifths, not integer-only locations.
+  # Reuse 24 patches of image 1 and 16 of image 2: packed boundaries are deliberately unequal.
+  grids = ((1,4,6), (1,4,4))
+  lengths = [h*w for _,h,w in grids]
+  pixels = np.concatenate((arrays["vision.pixel_values"][:24], arrays["vision.pixel_values"][24:40]))
+  grid = torch.tensor(grids)
+  expected, metrics = {}, {}
+  def capture(name):
+    def hook(_module, _inputs, output): expected[name] = output.float().numpy().copy()
+    return hook
+  def compare(name, actual, reference):
+    if not np.isfinite(actual).all() or not np.isfinite(reference).all(): raise ValueError(f"nonfinite vision output: {name}")
+    metrics[name] = error_metrics(actual, reference)
+    np.testing.assert_allclose(actual, reference, **tolerance, err_msg=f"{name}: {metrics[name]}")
+  with torch.no_grad():
+    expected["positions"] = oracle.fast_pos_embed_interpolate(grid).float().numpy()
+    expected["rotary"] = oracle.rot_pos_emb(grid).float().numpy()
+    modules = [("patch_embed",oracle.patch_embed), ("merger_norm",oracle.merger.norm)]
+    modules += [(f"block.{i}",block) for i,block in enumerate(oracle.blocks)]
+    handles = [module.register_forward_hook(capture(name)) for name,module in modules]
+    try: expected["merger"] = oracle(torch.from_numpy(pixels), grid).pooler_output.float().numpy()
+    finally:
+      for handle in handles: handle.remove()
+    separate = torch.cat([oracle(p, g[None]).pooler_output for p,g in zip(torch.from_numpy(pixels).split(lengths), grid)]).float().numpy()
+  compare("hf_packed_vs_separate", expected["merger"], separate)
+  pos, rotary = native.positions(grids)
+  compare("positions", pos.float().numpy(), expected["positions"])
+  compare("rotary", rotary.float().numpy(), expected["rotary"])
+  patches = native.patch_embed(Tensor(pixels))
+  compare("patch_embed", patches.float().numpy(), expected["patch_embed"])
+  x = patches + pos
+  for i,block in enumerate(native.blocks):
+    x = block(x, grids, rotary).realize()
+    compare(f"block.{i}", x.float().numpy(), expected[f"block.{i}"])
+  compare("merger_norm", native.merger.norm(x).float().numpy(), expected["merger_norm"])
+  compare("merger", native.merger(x).float().numpy(), expected["merger"])
+  # This is the unmodified production entry point, not only manually driven components.
+  full = native(Tensor(pixels), grids).float().numpy()
+  compare("full_tower", full, expected["merger"])
+  separate = np.concatenate([native(Tensor(p), (g,)).float().numpy() for p,g in zip(np.split(pixels, np.cumsum(lengths)[:-1]), grids)])
+  compare("native_packed_vs_separate", full, separate)
+  return {"phase":"vision", "synthetic":True, "device":Device.DEFAULT, "versions":VERSIONS, "transformers_commit":COMMIT,
+          "dtype":"bfloat16", "input_dtype":"float32 (official patch embed casts to BF16)", "grid_thw":grids,
+          "patch_lengths":lengths, "tolerance":tolerance, "metrics":metrics, "max_abs":max(v["max_abs"] for v in metrics.values()),
+          "scope":"Official HF eager BF16 full tower, existing synthetic weights rounded to BF16; component and packed/separate checks. "
+                  "No checkpoint, quantized, decoder or hardware acceptance."}
+
 
 def fusion_phase(manifest, arrays):
   """Live pinned complete synthetic vision->fusion->hybrid logits, not merely rotary component parity.
@@ -758,20 +846,25 @@ def controlled_suite():
   add("ablation_removed", "ablation", [], color_question, ["unknown"], False)
   return images, cases
 
+ABLATION_PAIRS = (("color_red", "color_blue"), ("color_red", "ablation_blank"), ("color_red", "ablation_removed"))
+
 def suite_manifest(images, cases):
   return {"name":"controlled-v1", "cases":cases,
           "images":{name:array_stats(np.asarray(image)) for name,image in images.items()},
           "scoring":"NFKC/casefold/whitespace and terminal punctuation normalization, then exact equality to predeclared answers",
-          "acceptance":{"visual_correct_min":18, "visual_total":20, "all_ordering":True, "all_text_controls":True, "all_ablations":True},
-          "ablation_pairs":[["color_red","color_blue"], ["color_red","ablation_blank"], ["color_red","ablation_removed"]]}
+          "acceptance":{"visual_correct_min":18, "visual_total":20, "all_ordering":True, "all_text_controls":True,
+                        "all_ablations":True, "all_ablation_pair_endpoints":True},
+          "ablation_pairs":[list(pair) for pair in ABLATION_PAIRS]}
 
 def quality_summary(cases, results):
   by_id = {r["id"]:r for r in results}
   passed = {c["id"]:answer_matches(by_id[c["id"]]["answer"], c["expected"]) and by_id[c["id"]]["stop_reason"] == "eos" for c in cases}
   visual = sum(passed[c["id"]] for c in cases if c["scored"])
   groups = {group:all(passed[c["id"]] for c in cases if c["category"] == group) for group in ("ordering", "text_control", "ablation")}
+  pairs = [{"endpoints":list(pair), "passed":all(passed[name] for name in pair)} for pair in ABLATION_PAIRS]
+  groups["ablation_pairs"] = all(pair["passed"] for pair in pairs)
   return {"visual_correct":visual, "visual_total":20, "minimum":18, "groups_passed":groups, "case_passed":passed,
-          "passed":visual >= 18 and all(groups.values())}
+          "ablation_pairs":pairs, "passed":visual >= 18 and all(groups.values())}
 
 def rss_record(raw, system):
   # getrusage is bytes on Darwin, KiB on Linux. Do not guess units on other OSes.
@@ -898,7 +991,7 @@ def checkpoint_phase(args):
     raise ValueError("real phases require existing local --model-dir and --gguf; no downloads")
   # No model construction, template compilation or warmup before production trust validation.
   start = time.perf_counter()
-  validate_vision_bundle(args.model_dir, args.gguf)
+  verified = validate_vision_bundle(args.model_dir, args.gguf)
   validation_s = time.perf_counter()-start
   checkpoint = trusted_checkpoint_record(args.model_dir, args.gguf)
   start = time.perf_counter()
@@ -921,7 +1014,7 @@ def checkpoint_phase(args):
   env.globals["strftime_now"] = lambda fmt: time.strftime(fmt)
   env.globals["bos_token"] = tokenizer.decode([tokenizer.bos_id]) if tokenizer.bos_id is not None else ""
   env.globals["eos_token"] = tokenizer.decode([tokenizer.eos_id])
-  template = env.from_string((args.model_dir/"chat_template.jinja").read_text())
+  template = env.from_string(verified["chat_template.jinja"].decode())
   tokenizer_template_s = time.perf_counter()-start
   limits = ImageLimits()
   images, cases = controlled_suite()
@@ -986,8 +1079,8 @@ def parse_args(argv=None):
   mode.add_argument("--generate", action="store_true")
   mode.add_argument("--verify", action="store_true")
   mode.add_argument("--check-reproducible", action="store_true")
-  mode.add_argument("--phase", choices=("text", "fusion", "processor-compare", "e2e", "benchmark"))
-  parser.add_argument("--synthetic", action="store_true", help="Required for the synthetic text/fusion phases; no checkpoint execution")
+  mode.add_argument("--phase", choices=("text", "vision", "fusion", "processor-compare", "e2e", "benchmark"))
+  parser.add_argument("--synthetic", action="store_true", help="Required for synthetic text/vision/fusion phases; no checkpoint execution")
   parser.add_argument("--output-dir", type=Path, default=ROOT)
   parser.add_argument("--metadata-dir", type=Path, help="Bootstrap only: directory containing the two pinned metadata JSON files")
   parser.add_argument("--model-dir", type=Path, help="Existing local trusted production vision bundle (never downloaded)")
@@ -1000,7 +1093,8 @@ def parse_args(argv=None):
   parser.add_argument("--report", type=Path, help="Write JSON for processor-compare/e2e/benchmark, also emitted on stdout")
   args = parser.parse_args(argv)
   if args.metadata_dir is not None and not args.generate: parser.error("--metadata-dir requires --generate")
-  if (args.phase in ("text", "fusion")) != args.synthetic: parser.error("only text/fusion phases require --synthetic (and vice versa)")
+  if (args.phase in ("text", "vision", "fusion")) != args.synthetic:
+    parser.error("only text/vision/fusion phases require --synthetic (and vice versa)")
   real = args.phase in ("e2e", "benchmark")
   if real:
     if args.model_dir is None or args.gguf is None: parser.error("e2e/benchmark require --model-dir and --gguf local paths; no downloads")
@@ -1033,13 +1127,13 @@ def main():
     return
   if args.phase:
     verify(args.output_dir)
-    from tinygrad import Device
-    from test.unit.test_llm_multimodal import compare_native_text
     manifest = json.loads((args.output_dir / "manifest.json").read_text())
     with np.load(args.output_dir / "reference.npz", allow_pickle=False) as src: arrays = {k: src[k] for k in src.files}
-    if args.phase == "fusion":
-      print(json.dumps(fusion_phase(manifest, arrays), indent=2))
+    if args.phase in ("vision", "fusion"):
+      print(json.dumps((vision_phase if args.phase == "vision" else fusion_phase)(manifest, arrays), indent=2))
       return
+    from tinygrad import Device
+    from test.unit.test_llm_multimodal import compare_native_text
     metrics = compare_native_text(manifest, arrays)
     tier = manifest["parity_tiers"]["native_cast"]["lowered_fp32_weights"]
     print(json.dumps({"phase": "text", "synthetic": True, "device": Device.DEFAULT, "tier": "native_cast.lowered_fp32_weights",
@@ -1051,8 +1145,8 @@ def main():
     if args.check_reproducible:
       with tempfile.TemporaryDirectory() as tmp:
         generate(Path(tmp), archive_dir=args.output_dir)
-        for name in ("reference.npz", "manifest.json"):
-          if (Path(tmp) / name).read_bytes() != (args.output_dir / name).read_bytes(): raise ValueError(f"regeneration differs: {name}")
-      print("Regeneration is byte-for-byte reproducible (archive and manifest).")
+        result = compare_reproduction(args.output_dir, Path(tmp))
+      print("Regeneration matches numerical array hashes, byte-for-byte archive and manifest identity excluding execution provenance.")
+      print(json.dumps(result, indent=2, sort_keys=True))
 
 if __name__ == "__main__": main()

@@ -50,6 +50,25 @@ class TestQwenVision(unittest.TestCase):
     expected = torch.nn.functional.layer_norm(torch.tensor(x).bfloat16(), (4,), eps=1e-6).float().numpy()
     np.testing.assert_array_equal(actual, expected)
 
+  def test_vision_bfloat16_full_tower_live_reference(self):
+    import importlib.metadata
+    from test.external.external_qwen_vl import VERSIONS, vision_phase
+    # Reference dependencies are optional for ordinary unit runs, and never imported during collection.
+    for name, version in VERSIONS.items():
+      try: installed = importlib.metadata.version(name)
+      except importlib.metadata.PackageNotFoundError: self.skipTest(f'live vision parity requires {name}=={version}')
+      if installed != version: self.skipTest(f'live vision parity requires {name}=={version}, found {installed}')
+    manifest, arrays = load_fixture()
+    result = vision_phase(manifest, arrays)
+    self.assertEqual(result['phase'], 'vision')
+    self.assertEqual(result['dtype'], 'bfloat16')
+    self.assertEqual(result['patch_lengths'], [24,16])
+    self.assertEqual(result['tolerance'], {'rtol':2e-2, 'atol':2e-2})
+    self.assertEqual(set(result['metrics']), {'positions', 'rotary', 'patch_embed', 'block.0', 'block.1', 'merger_norm',
+                                             'merger', 'full_tower', 'hf_packed_vs_separate', 'native_packed_vs_separate'})
+    self.assertEqual(result['max_abs'], max(v['max_abs'] for v in result['metrics'].values()))
+    print(f"BF16 vision full-tower max_abs={result['metrics']['full_tower']['max_abs']}; all components max_abs={result['max_abs']}")
+
   def test_vision_rejects_bad_grids(self):
     model, _, a = self.make_model()
     for grids in ((), ((2, 4, 6),), ((1, 3, 16),), ((1, 0, 48),), ((1, 4, 6),)):
