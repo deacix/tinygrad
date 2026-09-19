@@ -545,6 +545,7 @@ class Transformer:
       # Value checks are request-boundary work, never copyouts inside the decode JIT.
       if not inputs_embeds.isfinite().all().item() or not (position_ids >= 0).all().item():
         raise ValueError("embeddings must be finite and coordinates nonnegative")
+      if int(position_ids.max().item())+1-length != rope_delta: raise ValueError("rope_delta does not match prompt coordinates")
       if length == self.max_context: return
       temp = Tensor([temperature], dtype=dtypes.float32, device=device).realize()
       # Eager bounded chunks also on CPU GDN; unlike text prefill, do not force token-serial processing.

@@ -232,7 +232,8 @@ class Handler(VizHandler):
         except Exception:
           return self.send_data(json.dumps({"error":{"message":"vision inference failed", "type":"server_error"}}).encode(), status_code=500)
       # reply
-      max_tokens = body.get("max_completion_tokens", body.get("max_tokens"))
+      max_tokens = body.get("max_completion_tokens")
+      if max_tokens is None: max_tokens = body.get("max_tokens")
       if prepared is not None: max_tokens = min(max_tokens or self.server.max_output_tokens, self.server.max_output_tokens)
       chunks = self.run_model(prepared if prepared is not None else ids, body["model"],
                               not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),

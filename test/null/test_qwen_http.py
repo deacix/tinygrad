@@ -65,6 +65,15 @@ class TestQwenHTTP(unittest.TestCase):
     self.assertEqual(json.loads(body)["choices"][0]["finish_reason"],"length")
     self.assertEqual(self.closed,[True])
 
+  def test_nullable_completion_alias(self):
+    for stream in (False, True):
+      status, payload = self.request({"model":"test", "messages":[{"role":"user", "content":"hi"}],
+                                      "stream":stream, "max_completion_tokens":None, "max_tokens":1})
+      self.assertEqual(status,200)
+      if not stream: self.assertEqual(json.loads(payload)["usage"]["completion_tokens"],1)
+      else: self.assertEqual(payload.count(b'"content": "x"'),1)
+    self.assertEqual(self.closed,[True,True])
+
   def test_inner_generator_closed_before_next_request(self):
     chunks = Handler.run_model(Mock(server=self.server), [1,2], "test", max_tokens=1)
     next(chunks)

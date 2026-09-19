@@ -251,7 +251,7 @@ class TestQwenGenerate(unittest.TestCase):
     cases = [{"inputs_embeds":None}, {"position_ids":None}, {"inputs_embeds":x.half()}, {"inputs_embeds":x[:, :-1]},
              {"position_ids":pos.cast(dtypes.int64)}, {"position_ids":pos[:, 0]}, {"position_ids":pos.to("CPU:1")},
              {"inputs_embeds":x.to("CPU:1")}, {"inputs_embeds":x*float("nan")}, {"position_ids":pos-1},
-             {"rope_delta":-100}, {"rope_delta":2**31}, {"rope_delta":1.5}, {"chunk_size":0},
+             {"rope_delta":-100}, {"rope_delta":2**31}, {"rope_delta":1.5}, {"rope_delta":delta+1}, {"chunk_size":0},
              {"temperature":float("nan")}, {"temperature":float("inf")}, {"temperature":-1}]
     for bad in cases:
       with self.subTest(bad=list(bad)), patch.object(model, "forward_embeddings") as forward:
@@ -260,6 +260,8 @@ class TestQwenGenerate(unittest.TestCase):
         with self.assertRaises(ValueError): next(gen)
         forward.assert_not_called()
         self.assertEqual(model._cached_tokens, [])
+    with self.assertRaisesRegex(ValueError, "rope_delta"):
+      next(model.generate(ids.copy(), inputs_embeds=x, position_ids=pos))
     for tokens in ([], ids+[1]*model.max_context, [-1]*len(ids), [1000]*len(ids)):
       with self.assertRaises(ValueError): next(model.generate(tokens, **good))
 
