@@ -46,7 +46,8 @@ class TestQwenVision(unittest.TestCase):
     norm = VisionLayerNorm(4, eps=1e-6)
     norm.weight = Tensor.ones(4).cast(dtypes.bfloat16).realize()
     norm.bias = Tensor.zeros(4).cast(dtypes.bfloat16).realize()
-    actual = norm(Tensor(x).cast(dtypes.bfloat16).realize()).float().numpy()
+    # Inspect stored BF16, not an adjacent BF16->FP32 cast the compiler may eliminate.
+    actual = norm(Tensor(x).cast(dtypes.bfloat16).realize()).contiguous().realize().float().numpy()
     expected = torch.nn.functional.layer_norm(torch.tensor(x).bfloat16(), (4,), eps=1e-6).float().numpy()
     np.testing.assert_array_equal(actual, expected)
 

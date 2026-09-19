@@ -118,7 +118,13 @@ def compare_native_text(manifest, arrays):
         expected = arrays[ref + name]
         if name == "recurrent_state": expected = expected[:, heads].swapaxes(-1, -2)
         if name == "conv_state": expected = expected[:, channels, 1:].transpose(0, 2, 1)
-        compare(f"{mode}.step.{step}.{name}", actual, expected)
+        if name in ("keys", "values"):
+          # FP32 reduction orders can straddle one FP16 midpoint; use the chunk-replay single-storage-ULP contract.
+          error = np.abs(actual.astype(np.float32)-expected.astype(np.float32))
+          ulp = np.maximum(np.abs(np.spacing(actual.astype(np.float16))), np.abs(np.spacing(expected.astype(np.float16))))
+          np.testing.assert_array_equal(error <= ulp, True, err_msg=f"{mode}.step.{step}.{name}: exceeds one FP16 storage ULP")
+          metrics[f"{mode}.step.{step}.{name}"] = {"max_abs":float(error.max()), "max_storage_ulps":float((error/ulp).max())}
+        else: compare(f"{mode}.step.{step}.{name}", actual, expected)
   return metrics
 
 
