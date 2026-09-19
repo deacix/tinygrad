@@ -136,6 +136,9 @@ def preflight_placement(index:GGUFIndex, placement:LayerPlacement, *, max_contex
   if realize: raise ValueError('explicit placement requires REALIZE=0')
   kv = index.kv
   if kv.get('general.architecture') != 'llama': raise ValueError('explicit placement supports only dense llama')
+  # Omitted by some legacy writers. Explicit versions must describe the layouts decoded here (GGML_QUANT_VERSION=2).
+  if 'general.quantization_version' in kv and (type(kv['general.quantization_version']) is not int or kv['general.quantization_version'] != 2):
+    raise ValueError('unsupported GGUF quantization version for placement')
   def positive_int(key:str, default=None) -> int:
     value = kv.get(key, default)
     if type(value) is not int or value <= 0: raise ValueError(f'{key} must be a positive integer')

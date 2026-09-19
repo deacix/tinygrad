@@ -126,6 +126,22 @@ class TestLayerPlacement(unittest.TestCase):
       self.assertEqual(p.owner('blk.0.ffn_down.weight'), device)
 
 class TestPlacedLoading:
+  @pytest.mark.parametrize('typ,value', [(4,999),(4,1),(4,0),(8,'2'),(7,True),(6,2.0)])
+  def test_unknown_quantization_version_fails_before_copies(self, tmp_path, typ, value):
+    ts, kv, _ = llama_fixture(typ=2)
+    kv['general.quantization_version'] = (typ,value)
+    path, _ = save_llama(tmp_path,tensors=ts,metadata=kv)
+    with no_allocations(), pytest.raises(ValueError,match='quantization version'):
+      Transformer.from_gguf(path,realize=False,placement=LayerPlacement(('CPU','CPU:1'),(1,3)))
+
+  def test_explicit_quantization_version_two_is_accepted(self, tmp_path):
+    ts, kv, _ = llama_fixture(typ=2)
+    kv['general.quantization_version'] = (4,2)
+    path, _ = save_llama(tmp_path,tensors=ts,metadata=kv)
+    with no_allocations():
+      config, _ = model_module.preflight_placement(index_gguf(path),LayerPlacement(('CPU',),(4,)))
+    assert config.num_blocks == 4
+
   @pytest.mark.parametrize('key,typ,value', [
     ('general.architecture',8,'qwen2'), ('general.tensor_data_layout',8,'other'),
     ('llama.rope.scaling.type',8,'linear'), ('llama.rope.scaling.factor',6,2.0), ('llama.rope.scale_linear',6,2.0),
