@@ -18,6 +18,20 @@ Text phase uses tinygrad and the offline cast-tier fixtures (no reference instal
 Fusion phase uses the pinned reference environment plus tinygrad, reusing existing
 arrays for live complete synthetic vision/fusion/hybrid prefill and decode parity.
 Neither phase establishes full checkpoint, quantized or hardware acceptance.
+
+  python test/external/external_qwen_vl.py --phase processor-compare
+  python test/external/external_qwen_vl.py --phase e2e --model-dir PATH --gguf PATH --image-suite controlled
+  python test/external/external_qwen_vl.py --phase benchmark --model-dir PATH --gguf PATH --image-suite controlled
+
+Processor comparison is offline and uses the pinned reference environment, bundled
+RGB fixtures and a separately labeled synthetic vision tower. Real-checkpoint phases
+NEVER fetch files: both paths must name the production trusted bundle/pairing. They
+require sufficient hardware for Qwen3.8-27B, NOT the tiny synthetic model. New phases
+emit JSON (diagnostics on stderr); --report also saves it. Benchmark runs the quality
+suite once, then bounded warm repeats of text/single/max-area/two-image cases.
+A first request is process-cold, not filesystem/compiler-cache cold. Device actual
+peak memory is unavailable without an external profiler; counters are NOT that peak.
+Passing quality alone does not establish component or AMD arithmetic acceptance.
 """
 import argparse, contextlib, hashlib, importlib.metadata, io, json, platform, tempfile, zipfile, zlib
 from pathlib import Path
@@ -600,19 +614,423 @@ def fusion_phase(manifest, arrays):
           "native comparisons use the lowered FP32-weight cast oracle. No checkpoint/quantized/hardware acceptance.", "metrics":metrics}
 
 
-def main():
+def array_stats(value):
+  value = np.asarray(value)
+  if not np.isfinite(value).all(): raise ValueError("nonfinite evaluation output")
+  return {"shape":list(value.shape), "dtype":str(value.dtype), "sha256":digest(value.tobytes()),
+          "min":float(value.min()), "max":float(value.max()), "mean":float(value.mean()), "std":float(value.std())}
+
+def image_url(image):
+  import base64
+  buf = io.BytesIO()
+  image.save(buf, format="PNG", optimize=False, compress_level=9)
+  return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+def processor_compare(directory):
+  from PIL import Image
+  from tinygrad.llm.multimodal import ImageLimits, preprocess_image
+  torch, hf = reference_imports()
+  import transformers
+  from transformers import AutoImageProcessor
+  tv_source = "models/qwen2_vl/image_processing_qwen2_vl.py"
+  tv_hash = "f19497685281402691f0049a0ab5be8085f92fb5c37adfcc680e4ccd17863a77"
+  if digest((Path(transformers.__file__).parent/tv_source).read_bytes()) != tv_hash: raise ValueError("torchvision processor source mismatch")
+  with np.load(directory/"reference.npz", allow_pickle=False) as src: arrays = {k:src[k] for k in src.files}
+  meta = metadata({}, None, directory)
+  # Feature drift is an explicitly synthetic sensitivity probe, never checkpoint vision parity.
+  tower = hf.Qwen3_5VisionModel(hf.Qwen3_5VisionConfig(**VISION, attn_implementation="eager")).eval()
+  tower.load_state_dict({k.removeprefix("vision.weights."):torch.from_numpy(v) for k,v in arrays.items() if k.startswith("vision.weights.")})
+  records, outputs, settings = [], {}, {}
+  with tempfile.TemporaryDirectory() as tmp, torch.no_grad():
+    Path(tmp, "preprocessor_config.json").write_text(json.dumps(meta["preprocessor_config.json"]))
+    for policy, overrides in (("production", PROCESSOR), ("checkpoint_default", {})):
+      processors = {b:AutoImageProcessor.from_pretrained(tmp, backend=b, local_files_only=True, **overrides) for b in ("pil", "torchvision")}
+      settings[policy] = {b:{"class":type(p).__name__, **{k:dict(p.size) if k == "size" else getattr(p, k) for k in PROCESSOR}}
+                          for b,p in processors.items()}
+      for name in ("square", "tiny", "rectangle", "downscale"):
+        rgb = arrays[f"processor.{name}.rgb"]
+        row = {"fixture":name, "policy":policy, "input":array_stats(rgb), "backends":{}}
+        features = {}
+        for backend, processor in processors.items():
+          image = Image.fromarray(rgb)
+          result = processor(images=[image], return_tensors="pt")
+          repeated = processor(images=[image], return_tensors="pt")
+          pixels, grid = result.pixel_values.numpy(), result.image_grid_thw.numpy()
+          np.testing.assert_array_equal(pixels, repeated.pixel_values.numpy())
+          np.testing.assert_array_equal(grid, repeated.image_grid_thw.numpy())
+          features[backend] = tower(result.pixel_values, result.image_grid_thw).pooler_output.numpy()
+          row["backends"][backend] = {"grid_thw":grid.tolist(), "pixels":array_stats(pixels),
+                                       "synthetic_features":array_stats(features[backend]), "repeat_exact":True}
+          outputs[policy, name, backend] = pixels, grid
+        pil, grid = outputs[policy, name, "pil"]
+        tv, tv_grid = outputs[policy, name, "torchvision"]
+        np.testing.assert_array_equal(grid, tv_grid)
+        row["pil_vs_torchvision"] = {"pixels":error_metrics(pil, tv), "synthetic_features":error_metrics(features["pil"], features["torchvision"])}
+        if policy == "production":
+          native, native_grid = preprocess_image(image_url(Image.fromarray(rgb)), ImageLimits())
+          np.testing.assert_array_equal([native_grid], grid)
+          np.testing.assert_allclose(native, pil, rtol=0, atol=1e-7)
+          np.testing.assert_array_equal(pil, arrays[f"processor.{name}.pixel_values"])
+          row["native_vs_pil"] = error_metrics(native, pil)
+        else:
+          row["vs_production"] = {}
+          for backend in processors:
+            previous, previous_grid = outputs["production", name, backend]
+            current, current_grid = outputs[policy, name, backend]
+            same = np.array_equal(previous_grid, current_grid)
+            row["vs_production"][backend] = {"same_grid":same, "pixels":error_metrics(previous, current) if same else None,
+                                             "note":"different grids are not elementwise comparable" if not same else "same grid"}
+        records.append(row)
+  return {"phase":"processor-compare", "versions":VERSIONS, "transformers_commit":COMMIT, "checkpoint_revision":REVISION,
+          "metadata_sha256":METADATA_HASHES, "extra_source_sha256":{tv_source:tv_hash}, "hardware":platform.platform(),
+          "backend":"CPU HF PIL and torchvision; native host preprocessing", "dtype":"float32", "context":None,
+          "checkpoint_weights_loaded":False, "feature_scope":"Existing seeded tiny FP32 vision fixture only, NOT real checkpoint features",
+          "tolerance":{"native_vs_pil":{"rtol":0, "atol":1e-7}, "pil_vs_torchvision":"drift report, not bitwise parity"},
+          "settings":settings, "fixtures":records}
+
+def normalize_answer(text):
+  import re, unicodedata
+  # Exact normalized equality, NOT a substring/keyword test: "red and blue", "not red" and "blue, red" all fail "red".
+  return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", text).casefold()).strip().strip(". !?\"'")
+
+def answer_matches(answer, expected): return normalize_answer(answer) in {normalize_answer(x) for x in expected}
+
+def controlled_suite():
+  """20 predeclared visual questions plus unscored-in-the-20 controls; no system fonts/network/RNG needed."""
+  from PIL import Image, ImageDraw
+  colors = {"red":(255,0,0), "blue":(0,0,255), "green":(0,180,0), "yellow":(255,255,0), "gray":(128,128,128)}
+  images = {k:Image.new("RGB", (512,512) if k == "yellow" else (256,256), v) for k,v in colors.items()}
+  for shape in ("circle", "square", "triangle", "rectangle"):
+    image = Image.new("RGB", (256,256), "white")
+    draw = ImageDraw.Draw(image)
+    if shape == "circle": draw.ellipse((48,48,208,208), fill="black")
+    elif shape == "triangle": draw.polygon([(128,32),(32,224),(224,224)], fill="black")
+    else: draw.rectangle((48,48,208,208) if shape == "square" else (24,80,232,176), fill="black")
+    images[shape] = image
+  # Explicit 5x7 glyphs make OCR pixels reproducible across Pillow/system font versions.
+  glyphs = {"S":["01111","10000","10000","01110","00001","00001","11110"],
+            "T":["11111","00100","00100","00100","00100","00100","00100"],
+            "O":["01110","10001","10001","10001","10001","10001","01110"],
+            "P":["11110","10001","10001","11110","10000","10000","10000"],
+            "C":["01111","10000","10000","10000","10000","10000","01111"],
+            "A":["01110","10001","10001","11111","10001","10001","10001"],
+            "1":["00100","01100","00100","00100","00100","00100","01110"],
+            "2":["01110","10001","00001","00010","00100","01000","11111"],
+            "3":["11110","00001","00001","01110","00001","00001","11110"],
+            "4":["00010","00110","01010","10010","11111","00010","00010"]}
+  for word in ("STOP", "CAT", "123", "42"):
+    image = Image.new("RGB", (256,256), "white")
+    draw, scale = ImageDraw.Draw(image), 10
+    left, top = (256-(len(word)*6-1)*scale)//2, 93
+    for i, char in enumerate(word):
+      for y, line in enumerate(glyphs[char]):
+        for x, bit in enumerate(line):
+          if bit == "1": draw.rectangle((left+(i*6+x)*scale, top+y*scale, left+(i*6+x+1)*scale-1, top+(y+1)*scale-1), fill="black")
+    images[word] = image
+  for name, heights in (("chart_red", (150,65)), ("chart_blue", (65,150)), ("chart_equal", (120,120)), ("chart_three", (70,150,110))):
+    image = Image.new("RGB", (256,256), "white")
+    draw = ImageDraw.Draw(image)
+    draw.line((20,20,20,220,240,220), fill="black", width=3)
+    for i, height in enumerate(heights): draw.rectangle((42+i*68,220-height,86+i*68,218), fill=colors[("red","blue","green")[i]])
+    images[name] = image
+  cases = []
+  def add(name, category, media, question, expected, scored=True):
+    cases.append({"id":name, "category":category, "images":list(media), "question":question, "expected":list(expected), "scored":scored})
+  color_question = "What color fills the image? Reply with just one color word. If there is no image, reply unknown."
+  for color in ("red", "blue", "green", "yellow"): add("color_"+color, "color", [color], color_question, [color])
+  for shape in ("circle", "square", "triangle", "rectangle"):
+    add("shape_"+shape, "shape", [shape], "Name the single black shape. Reply with just the shape name.", [shape])
+  for word in ("STOP", "CAT", "123", "42"):
+    add("ocr_"+word.lower(), "ocr", [word], "Read the text in the image. Reply with only the text.", [word])
+  for name, question, answer in (("chart_red","Which bar is taller? Reply red or blue.","red"),
+                                  ("chart_blue","Which bar is taller? Reply red or blue.","blue"),
+                                  ("chart_equal","Are the two bars the same height? Reply yes or no.","yes"),
+                                  ("chart_three","How many colored bars are there? Reply with a digit.","3")):
+    add(name, "chart", [name], question, [answer])
+  for name, media, answer in (("order_red_blue", ["red","blue"], "red"), ("order_blue_red", ["blue","red"], "blue"),
+                              ("order_circle_triangle", ["circle","triangle"], "circle"),
+                              ("order_triangle_circle", ["triangle","circle"], "triangle")):
+    noun = "color" if media[0] in colors else "shape"
+    add(name, "ordering", media, f"What {noun} is in the FIRST image? Reply with just the {noun} name.", [answer])
+  add("text_math", "text_control", [], "What is 2 + 2? Reply with just a digit.", ["4"], False)
+  add("text_capital", "text_control", [], "What is the capital of France? Reply with just the city name.", ["Paris"], False)
+  add("ablation_blank", "ablation", ["gray"], color_question, ["gray", "grey"], False)
+  add("ablation_removed", "ablation", [], color_question, ["unknown"], False)
+  return images, cases
+
+def suite_manifest(images, cases):
+  return {"name":"controlled-v1", "cases":cases,
+          "images":{name:array_stats(np.asarray(image)) for name,image in images.items()},
+          "scoring":"NFKC/casefold/whitespace and terminal punctuation normalization, then exact equality to predeclared answers",
+          "acceptance":{"visual_correct_min":18, "visual_total":20, "all_ordering":True, "all_text_controls":True, "all_ablations":True},
+          "ablation_pairs":[["color_red","color_blue"], ["color_red","ablation_blank"], ["color_red","ablation_removed"]]}
+
+def quality_summary(cases, results):
+  by_id = {r["id"]:r for r in results}
+  passed = {c["id"]:answer_matches(by_id[c["id"]]["answer"], c["expected"]) and by_id[c["id"]]["stop_reason"] == "eos" for c in cases}
+  visual = sum(passed[c["id"]] for c in cases if c["scored"])
+  groups = {group:all(passed[c["id"]] for c in cases if c["category"] == group) for group in ("ordering", "text_control", "ablation")}
+  return {"visual_correct":visual, "visual_total":20, "minimum":18, "groups_passed":groups, "case_passed":passed,
+          "passed":visual >= 18 and all(groups.values())}
+
+def rss_record(raw, system):
+  # getrusage is bytes on Darwin, KiB on Linux. Do not guess units on other OSes.
+  unit = "bytes" if system == "Darwin" else "KiB" if system == "Linux" else "platform-dependent"
+  return {"raw":raw, "raw_unit":unit, "bytes":raw*(1024 if system == "Linux" else 1) if unit != "platform-dependent" else None,
+          "scope":"process lifetime high-water RSS, not per-request incremental peak; includes libraries and mapped weights"}
+
+def memory_snapshot():
+  from tinygrad.helpers import GlobalCounters
+  try:
+    import resource
+    host = rss_record(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, platform.system())
+  except ImportError: host = {"bytes":None, "scope":"resource.getrusage unavailable"}
+  return {"host_peak_rss":host, "tinygrad_live_buffer_bytes":GlobalCounters.mem_used,
+          "tinygrad_live_buffer_bytes_by_device":dict(GlobalCounters.mem_used_per_device),
+          "actual_device_peak_bytes":None,
+          "device_scope":"GlobalCounters tracks live Buffer allocations, NOT allocator-reserved/driver memory or actual peak; "
+                         "external profiler required"}
+
+def installed_versions():
+  versions = {"python":platform.python_version()}
+  for name in ("tinygrad", *VERSIONS):
+    try: versions[name] = importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError: versions[name] = None
+  return versions
+
+def trusted_checkpoint_record(model_dir, gguf):
+  from tinygrad.llm.vision import BUNDLE_FILES, GGUF_DIGEST, MODEL_REVISION, GGUF_REVISION
+  def record(path, spec):
+    size, checksum = spec
+    return {"path":str(path.resolve()), "bytes":size, "digest":checksum,
+            "algorithm":"git-blob-sha1" if len(checksum) == 40 else "sha256", "validated":True}
+  return {"model_revision":MODEL_REVISION, "gguf_revision":GGUF_REVISION, "gguf":record(gguf, GGUF_DIGEST),
+          "bundle":{name:record(model_dir/name, spec) for name,spec in BUNDLE_FILES.items()},
+          "tokenizer":"SimpleTokenizer from validated GGUF token table; no alternate tokenizer"}
+
+def timed_request(model, vision, tokenizer, template, limits, case, urls, args):
+  import time
+  from tinygrad import Device
+  from tinygrad.llm.multimodal import prepare_prompt, embed_prompt
+  from tinygrad.llm.vision import QwenVision
+  device = model.token_embd.weight.device
+  def sync(): Device[device].synchronize()
+  model.reset_generation_state()  # Also isolate text repeats: no prefix-cache shortcut in warm measurements.
+  sync()
+  samples, times = {"before":memory_snapshot()}, {}
+  start = time.perf_counter()
+  content = [{"type":"image_url", "image_url":{"url":urls[name]}} for name in case["images"]]
+  content.append({"type":"text", "text":case["question"]})
+  prompt = prepare_prompt([{"role":"user", "content":content}], tokenizer, template, limits=limits, device=device,
+                          max_context=model.max_context, template_kwargs={"enable_thinking":False})
+  if prompt.starts_reasoning: raise ValueError("quality protocol requires non-thinking answers")
+  if len(prompt.tokens)+args.max_output_tokens > model.max_context: raise ValueError("prompt plus output budget exceeds context")
+  sync()
+  times["preprocess_s"] = time.perf_counter()-start
+  samples["prepared"] = memory_snapshot()
+  times["vision_s"] = 0.0
+  embeddings = None
+  if prompt.pixel_values is not None:
+    encode = QwenVision.__call__
+    def timed_vision(self, *a, **kw):
+      sync()
+      before = time.perf_counter()
+      result = encode(self, *a, **kw)
+      result.realize()
+      sync()
+      times["vision_s"] += time.perf_counter()-before
+      samples["vision"] = memory_snapshot()
+      return result
+    before = time.perf_counter()
+    with patch.object(QwenVision, "__call__", timed_vision): embeddings = embed_prompt(model, vision, prompt)
+    sync()
+    times["embed_fusion_s"] = time.perf_counter()-before-times["vision_s"]
+  else: times["embed_fusion_s"] = 0.0
+  samples["embedded"] = memory_snapshot()
+  gen = model.generate(list(prompt.tokens), chunk_size=args.chunk_size, temperature=0.0,
+                       inputs_embeds=embeddings, position_ids=prompt.position_ids, rope_delta=prompt.rope_delta)
+  ids, latencies, stop_reason = [], [], "output_limit"
+  try:
+    for step in range(args.max_output_tokens):
+      before = time.perf_counter()
+      try: token = next(gen)
+      except StopIteration:
+        stop_reason = "context_limit"
+        break
+      sync()
+      elapsed = time.perf_counter()-before
+      latencies.append(elapsed)
+      if step == 0:
+        times["prefill_s"], times["first_token_s"] = elapsed, time.perf_counter()-start
+        samples["first_token"] = memory_snapshot()
+      ids.append(token)
+      if tokenizer.is_end(token):
+        stop_reason = "eos"
+        break
+    sync()
+    times["decode_s"] = sum(latencies[1:])
+    times["total_s"] = time.perf_counter()-start
+    samples["completed"] = memory_snapshot()
+  finally:
+    gen.close()
+    model.reset_generation_state()
+  answer = tokenizer.decode([token for token in ids if not tokenizer.is_end(token)])
+  decoded = max(0, len(ids)-1)
+  return {"id":case["id"], "category":case["category"], "answer":answer, "expected":case["expected"],
+          "answer_match":answer_matches(answer, case["expected"]), "stop_reason":stop_reason, "generated_token_ids":ids,
+          "prompt_tokens":len(prompt.tokens), "generated_tokens_including_eos":len(ids), "decode_tokens_including_eos":decoded,
+          "grid_thw":prompt.grid_thw, "visual_tokens":sum(count for _,count in prompt.image_spans), "rope_delta":prompt.rope_delta,
+          "timing":times, "decode_token_seconds":latencies[1:],
+          "decode_tokens_per_second":decoded/times["decode_s"] if times["decode_s"] else None,
+          "memory":samples, "sampled_max_live_buffer_bytes":max(x["tinygrad_live_buffer_bytes"] for x in samples.values())}
+
+def checkpoint_phase(args):
+  import os, time
+  import jinja2
+  from tinygrad import Device, Tensor, nn
+  from tinygrad.helpers import DEV, getenv
+  from tinygrad.llm.kernels.amd import amd_custom_kernels_supported
+  from tinygrad.llm.cli import SimpleTokenizer
+  from tinygrad.llm.model import Transformer
+  from tinygrad.llm.multimodal import ImageLimits
+  from tinygrad.llm.vision import validate_vision_bundle, validate_vision_metadata, load_vision
+  if not args.model_dir.is_dir() or not args.gguf.is_file():
+    raise ValueError("real phases require existing local --model-dir and --gguf; no downloads")
+  # No model construction, template compilation or warmup before production trust validation.
+  start = time.perf_counter()
+  validate_vision_bundle(args.model_dir, args.gguf)
+  validation_s = time.perf_counter()-start
+  checkpoint = trusted_checkpoint_record(args.model_dir, args.gguf)
+  start = time.perf_counter()
+  model, kv = Transformer.from_gguf(args.gguf, args.max_context, realize=True)
+  validate_vision_metadata(kv)
+  device = model.token_embd.weight.device
+  if not isinstance(device, str) or device.split(":")[0] in ("NULL", "DISK", "NPY", "PYTHON"):
+    raise ValueError("real checkpoint evaluation requires a single executing decoder device")
+  vision = load_vision(args.model_dir, device=device)
+  Device[device].synchronize()
+  load_s = time.perf_counter()-start
+  loaded_memory = memory_snapshot()
+  # Snapshot before JIT/cache tensors become part of the model's object graph.
+  weight_dtypes = {name:sorted({str(t.dtype) for t in nn.state.get_parameters(module)}) for name,module in (("decoder",model),("vision",vision))}
+  start = time.perf_counter()
+  tokenizer = SimpleTokenizer.from_gguf_kv(kv)
+  env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True)
+  env.filters["tojson"] = lambda obj, **kwargs: json.dumps(obj, **kwargs)
+  env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(RuntimeError(msg))
+  env.globals["strftime_now"] = lambda fmt: time.strftime(fmt)
+  env.globals["bos_token"] = tokenizer.decode([tokenizer.bos_id]) if tokenizer.bos_id is not None else ""
+  env.globals["eos_token"] = tokenizer.decode([tokenizer.eos_id])
+  template = env.from_string((args.model_dir/"chat_template.jinja").read_text())
+  tokenizer_template_s = time.perf_counter()-start
+  limits = ImageLimits()
+  images, cases = controlled_suite()
+  suite = suite_manifest(images, cases)
+  suite_hash = digest(json.dumps(suite, sort_keys=True).encode())
+  urls = {name:image_url(image) for name,image in images.items()}
+  # The input manifest and all answers are frozen before generation. No adaptive prompts or retries.
+  Tensor.manual_seed(SEED)
+  results = []
+  for index, case in enumerate(cases):
+    row = timed_request(model, vision, tokenizer, template, limits, case, urls, args)
+    row["run_state"] = "process_first_request" if index == 0 else "suite_first_pass_shared_compiler_and_jit_state"
+    results.append(row)
+  quality = quality_summary(cases, results)
+  repeats = []
+  if args.phase == "benchmark":
+    # Four bounded workloads: text, default-area image, maximum-area image, two images/order.
+    for name in ("text_math", "color_red", "color_yellow", "order_red_blue"):
+      case = next(c for c in cases if c["id"] == name)
+      for repeat in range(args.warm_runs):
+        row = timed_request(model, vision, tokenizer, template, limits, case, urls, args)
+        row.update({"run_state":"warm_repeat_no_prefix_reuse", "repeat":repeat+1})
+        repeats.append(row)
+  warm_passed = all(r["answer_match"] and r["stop_reason"] == "eos" for r in repeats)
+  renderer = Device[device].renderer
+  return {"phase":args.phase, "synthetic":False, "checkpoint_weights_loaded":True, "versions":installed_versions(),
+          "checkpoint":checkpoint, "harness_sha256":digest(Path(__file__).read_bytes()),
+          "production_source_sha256":{name:digest((Path(__file__).resolve().parents[2]/"tinygrad/llm"/name).read_bytes())
+                                      for name in ("cli.py", "model.py", "vision.py", "multimodal.py", "gguf.py", "kernels/amd.py")},
+          "hardware":{"platform":platform.platform(), "machine":platform.machine(), "processor":platform.processor(),
+                      "logical_cpus":os.cpu_count(), "device":device, "arch":str(Device[device].arch),
+                      "renderer":type(renderer).__name__, "renderer_target":str(renderer.target), "DEV":str(DEV)},
+          "backend":{"runtime":type(Device[device]).__name__, "temperature":0.0, "seed":SEED,
+                     "amd_custom_kernels_supported":amd_custom_kernels_supported(device), "HALF":getenv("HALF", 1),
+                     "realize_weights_before_requests":True, "prefix_cache_reuse":False,
+                     "note":"production dispatch unchanged; quantized/backend arithmetic is not an FP32 parity claim"},
+          "dtype":{"decoder_parameter_types":weight_dtypes["decoder"], "vision_parameter_types":weight_dtypes["vision"],
+                   "pixels_and_fused_embeddings":"float32", "kv_cache":"float16", "note":"mixed native arithmetic; not a single-dtype model"},
+          "context":{"max_context":model.max_context, "max_output_tokens":args.max_output_tokens, "requested_chunk_size":args.chunk_size,
+                     "multimodal_chunk_size":min(args.chunk_size,32), "text_chunk_size":"production CPU GDN may force 1"},
+          "image_limits":vars(limits), "suite":suite, "suite_sha256":suite_hash, "quality":quality,
+          "timing":{"bundle_validation_s":validation_s, "model_load_and_realize_s":load_s, "tokenizer_template_s":tokenizer_template_s},
+          "timing_scope":{"preprocess_s":"decode/resize/normalize/patch, official template, tokenize and device transfer",
+                          "vision_s":"synchronized actual QwenVision call within production embed_prompt",
+                          "embed_fusion_s":"embedding and splice excluding timed vision call",
+                          "prefill_s":"first generate.next: prefill INCLUDING validation, sample and token copyout (not isolated forward)",
+                          "first_token_s":"request wall time from preparation start to first generated token, not first displayed text",
+                          "decode_s":"sum of synchronized later next calls, including EOS; excludes first token",
+                          "total_s":"preparation through final generated token including Python orchestration; excludes model loading",
+                          "cold":"first request in this process; disk/compiler caches NOT purged; model already realized",
+                          "warm":"bounded repeats after suite; retains compiled kernels/JIT but resets request state/prefix cache"},
+          "results":results, "warm_results":repeats, "warm_runs_per_workload":args.warm_runs if args.phase == "benchmark" else 0,
+          "memory_after_load":loaded_memory, "memory":memory_snapshot(), "quality_gate_passed":quality["passed"] and warm_passed,
+          "release_acceptance":False, "remaining_gates":["component/reference regression evidence on this backend",
+            "actual device peak memory via external profiler and provisioned-hardware capacity review",
+            "matching-weight generic/AMD arithmetic drift and hybrid tail counts 1/15/16/17/31/32/33 if advertising AMD",
+            "CLI/API full-checkpoint hardware acceptance; this harness tests the shared production pipeline only"]}
+
+def parse_args(argv=None):
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   mode = parser.add_mutually_exclusive_group(required=True)
   mode.add_argument("--generate", action="store_true")
   mode.add_argument("--verify", action="store_true")
   mode.add_argument("--check-reproducible", action="store_true")
-  mode.add_argument("--phase", choices=("text", "fusion"))
+  mode.add_argument("--phase", choices=("text", "fusion", "processor-compare", "e2e", "benchmark"))
   parser.add_argument("--synthetic", action="store_true", help="Required for the synthetic text/fusion phases; no checkpoint execution")
   parser.add_argument("--output-dir", type=Path, default=ROOT)
   parser.add_argument("--metadata-dir", type=Path, help="Bootstrap only: directory containing the two pinned metadata JSON files")
-  args = parser.parse_args()
+  parser.add_argument("--model-dir", type=Path, help="Existing local trusted production vision bundle (never downloaded)")
+  parser.add_argument("--gguf", type=Path, help="Existing local trusted Qwen3.8 GGUF (never downloaded)")
+  parser.add_argument("--image-suite", choices=("controlled",), default="controlled")
+  parser.add_argument("--max-context", type=int, default=4096)
+  parser.add_argument("--max-output-tokens", type=int, default=32, help="Includes EOS; hard maximum 256")
+  parser.add_argument("--chunk-size", type=int, default=32, help="Requested production prefill size, in [1,32]")
+  parser.add_argument("--warm-runs", type=int, default=2, help="Benchmark repeats per workload, in [1,3]")
+  parser.add_argument("--report", type=Path, help="Write JSON for processor-compare/e2e/benchmark, also emitted on stdout")
+  args = parser.parse_args(argv)
   if args.metadata_dir is not None and not args.generate: parser.error("--metadata-dir requires --generate")
-  if bool(args.phase) != args.synthetic: parser.error("--phase requires --synthetic (and vice versa)")
+  if (args.phase in ("text", "fusion")) != args.synthetic: parser.error("only text/fusion phases require --synthetic (and vice versa)")
+  real = args.phase in ("e2e", "benchmark")
+  if real:
+    if args.model_dir is None or args.gguf is None: parser.error("e2e/benchmark require --model-dir and --gguf local paths; no downloads")
+    if not args.model_dir.is_dir() or not args.gguf.is_file(): parser.error("--model-dir and --gguf must exist locally; no downloads")
+  elif args.model_dir is not None or args.gguf is not None: parser.error("checkpoint paths require e2e/benchmark")
+  if not 1 <= args.warm_runs <= 3: parser.error("--warm-runs must be in [1,3]")
+  if not 1 <= args.chunk_size <= 32: parser.error("--chunk-size must be in [1,32]")
+  if not 1 <= args.max_output_tokens <= 256: parser.error("--max-output-tokens must be in [1,256]")
+  if not args.max_output_tokens < args.max_context <= 4096: parser.error("output budget must be less than context, capped at 4096")
+  if args.report is not None and args.phase not in ("processor-compare", "e2e", "benchmark"):
+    parser.error("--report requires processor-compare/e2e/benchmark")
+  return args
+
+def main():
+  import sys
+  args = parse_args()
+  if args.phase in ("processor-compare", "e2e", "benchmark"):
+    # JSON-only stdout; production diagnostics and verification go to stderr.
+    with contextlib.redirect_stdout(sys.stderr):
+      if args.phase == "processor-compare":
+        verify(args.output_dir)
+        result = processor_compare(args.output_dir)
+      else: result = checkpoint_phase(args)
+    raw = json.dumps(result, indent=2, sort_keys=True, allow_nan=False)+"\n"
+    if args.report is not None:
+      args.report.parent.mkdir(parents=True, exist_ok=True)
+      args.report.write_text(raw)
+    print(raw, end="")
+    if result.get("quality_gate_passed") is False: raise SystemExit(1)
+    return
   if args.phase:
     verify(args.output_dir)
     from tinygrad import Device

@@ -3286,7 +3286,7 @@
     "path": "test/external/external_qwen_vl.py",
     "regenerate": "python test/external/external_qwen_vl.py --generate",
     "reproducibility": "--check-reproducible regenerates and compares BOTH files byte-for-byte",
-    "sha256": "eb587600841dcc8bf7329839dabceeec6c66a2d5104d0acab86dac06ccacb06f"
+    "sha256": "6dee5c408f80eb7df80c708ea2b8872001571869d727135741173f75c187bd89"
   },
   "layouts": {
     "coordinates.*.position_ids": "3,1,L (T,H,W); physical spans exclude delimiters, official not small-vocab IDs",
