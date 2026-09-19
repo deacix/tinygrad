@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, pathlib, re, time, typing, uuid
+import copy, json, math, pathlib, re, socket, time, typing, uuid
 from typing import TYPE_CHECKING
 from tinygrad.helpers import DEBUG, colored, stderr_log
 from tinygrad.viz.serve import TCPServerWithReuse, Handler as VizHandler
@@ -67,11 +67,23 @@ class Handler(VizHandler):
     if self.path == "/v1/models": self.send_data(json.dumps({"object":"list","data":[{"id":self.server.model_name,"object":"model"}]}).encode())
     elif self.path.startswith("/assets/"): super().do_GET()
     else: self.send_data((pathlib.Path(__file__).parent / "chat.html").read_bytes(), content_type="text/html")
-  def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
-                reasoning:bool=False):
+  def run_model(self, ids, model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
+                reasoning:bool=False, embeddings=None):
     model, tok = self.server.model, self.server.tok
+    generation_kwargs:dict[str,typing.Any] = {}
+    if not isinstance(ids, list):
+      from tinygrad.llm.multimodal import PreparedPrompt, embed_prompt
+      if not isinstance(ids, PreparedPrompt): raise ValueError("invalid prepared prompt")
+      prompt = ids
+      reasoning = prompt.starts_reasoning
+      if prompt.pixel_values is not None:
+        if embeddings is None: embeddings = embed_prompt(model, self.server.vision, prompt)
+        generation_kwargs = {"inputs_embeds":embeddings, "position_ids":prompt.position_ids, "rope_delta":prompt.rope_delta}
+      ids = list(prompt.tokens)
     prompt_tokens = len(ids)
-    cache_start_pos = model.get_start_pos(ids)
+    remaining = model.max_context-prompt_tokens
+    if generation_kwargs: max_tokens = min(max_tokens or self.server.max_output_tokens or 256, remaining)
+    cache_start_pos = 0 if generation_kwargs else model.get_start_pos(ids)
     stderr_log(f"in:{colored(f'{cache_start_pos:5d}', 'green')} +{len(ids)-cache_start_pos:5d}  {colored('--', 'BLACK')}  ")
     tmpl = {"id":f"chatcmpl-{uuid.uuid4().hex[:24]}", "object":"chat.completion.chunk", "created":int(time.time()), "model":model_name}
     def chunk(d:dict): return {"choices": [{"index":0, "delta":d, "finish_reason":None}], **tmpl}
@@ -86,9 +98,10 @@ class Handler(VizHandler):
       stderr_log(f"gen:{len(out)/(et-pt) if len(out) > 1 else 0:4.0f} tok/s  {colored('--', 'BLACK')}  "
                  f"out:{len(out):5d}  {colored('--', 'BLACK')}  {colored(total, 'red') if interrupted else total}\n")
     completed = False
+    gen = model.generate(ids, temperature=temperature, **generation_kwargs)
     try:
       yield chunk({"role":"assistant", "content":""})
-      for next_id in model.generate(ids, temperature=temperature):
+      for next_id in gen:
         if len(out) == 0:
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
         if tok.is_end(next_id): break
@@ -97,6 +110,9 @@ class Handler(VizHandler):
         if max_tokens is not None and len(out) >= max_tokens:
           finish_reason = "length"
           break
+      # Close before yielding the final chunk so a retained iterator cannot reset a later request.
+      if close := getattr(gen, "close", None): close()
+      if generation_kwargs and len(out) >= remaining: finish_reason = "length"
       for field, delta in router.route(dec(), final=True): yield chunk({field:delta})
       tool_calls: list[dict] = []
       for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL):
@@ -119,18 +135,101 @@ class Handler(VizHandler):
     except GeneratorExit:
       if not completed: log_stats(interrupted=True)
       raise
+    finally:
+      if close := getattr(gen, "close", None): close()
+
+  def read_chat_request(self) -> dict:
+    from tinygrad.llm.multimodal import ImageInputError
+    limits = self.server.image_limits
+    cap = limits.max_request_bytes if limits is not None else 16*1024*1024
+    lengths = self.headers.get_all("Content-Length", [])
+    if self.headers.get("Transfer-Encoding") or len(lengths) != 1 or not re.fullmatch(r"[0-9]+", lengths[0]):
+      raise ImageInputError("a single Content-Length without Transfer-Encoding is required")
+    length = int(lengths[0])
+    if length > cap: raise ImageInputError("request byte budget exceeded", 413)
+    previous = self.connection.gettimeout()
+    try:
+      deadline, remaining, chunks = time.monotonic()+10, length, []
+      while remaining:
+        timeout = deadline-time.monotonic()
+        if timeout <= 0: raise ImageInputError("request body deadline exceeded")
+        self.connection.settimeout(timeout)
+        chunk = self.rfile.read1(min(65536, remaining))
+        if not chunk: raise ImageInputError("truncated request body")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+      body = json.loads(b"".join(chunks))
+    except ImageInputError: raise
+    except (ValueError, UnicodeError, RecursionError, socket.timeout): raise ImageInputError("invalid or incomplete JSON request") from None
+    finally: self.connection.settimeout(previous)
+    stack = [(body, 0)]
+    while stack:
+      value, depth = stack.pop()
+      if depth > 32: raise ImageInputError("request JSON nesting exceeds 32 levels")
+      if isinstance(value, dict): stack.extend((item,depth+1) for item in value.values())
+      elif isinstance(value, list): stack.extend((item,depth+1) for item in value)
+    if not isinstance(body, dict) or not isinstance(body.get("model"), str): raise ImageInputError("request model must be a string")
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages: raise ImageInputError("messages must be a nonempty array")
+    for message in messages:
+      # Text role semantics belong to its selected template (including developer/custom roles).
+      # Qwen-specific role restrictions are enforced by prepare_prompt when vision is enabled.
+      if not isinstance(message, dict) or not isinstance(message.get("role"), str) or not message["role"]:
+        raise ImageInputError("invalid message role")
+      content = message.get("content")
+      if not isinstance(content, (str,list,type(None))): raise ImageInputError("invalid message content")
+      if isinstance(content, list):
+        for part in content:
+          if not isinstance(part, dict) or part.get("type") not in ("text", "image_url"): raise ImageInputError("unsupported content part")
+          if part["type"] == "text" and not isinstance(part.get("text"), str): raise ImageInputError("invalid text content")
+          if part["type"] == "image_url" and self.server.vision is None: raise ImageInputError("this server has no vision bundle")
+      calls = message.get("tool_calls")
+      if calls is not None and (not isinstance(calls, list) or any(not isinstance(tc, dict) or not isinstance(tc.get("function"), dict)
+                                                                for tc in calls)): raise ImageInputError("invalid tool calls")
+    for key in ("max_completion_tokens", "max_tokens"):
+      if key in body and body[key] is not None and (type(body[key]) is not int or body[key] <= 0): raise ImageInputError(f"{key} must be positive")
+    temperature = body.get("temperature", 0.0)
+    try: valid_temperature = type(temperature) in (int,float) and math.isfinite(temperature) and temperature >= 0
+    except OverflowError: valid_temperature = False
+    if not valid_temperature: raise ImageInputError("invalid temperature")
+    if body.get("stream") is None: body["stream"] = False
+    if type(body["stream"]) is not bool: raise ImageInputError("stream must be boolean")
+    if body.get("stream_options") is None: body["stream_options"] = {}
+    if not isinstance(body["stream_options"], dict): raise ImageInputError("invalid stream options")
+    if not isinstance(body.get("chat_template_kwargs", {}), dict): raise ImageInputError("invalid chat template options")
+    if body.get("tools") is not None and not isinstance(body["tools"], list): raise ImageInputError("tools must be an array")
+    return body
 
   def do_POST(self):
     request_st = time.perf_counter()
     stderr_log(f"{self.path}  {colored('--', 'BLACK')}  ")
-    raw_body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-    body: dict[str, typing.Any] = json.loads(raw_body.decode("utf-8"))
-    if DEBUG >= 1: print(json.dumps(body, indent=2))
+    from tinygrad.llm.multimodal import ImageInputError, prepare_prompt
+    if self.path != "/v1/chat/completions":
+      return self.send_data(json.dumps({"error":{"message":"unknown endpoint", "type":"invalid_request_error"}}).encode(), status_code=404)
+    try:
+      body = self.read_chat_request()
+      prepared = None
+      if self.server.vision is not None:
+        options = dict(body.get("chat_template_kwargs", {}))
+        if "reasoning_effort" in body: options["reasoning_effort"] = body["reasoning_effort"]
+        device = self.server.model.token_embd.weight.device
+        if not isinstance(device, str): raise ImageInputError("vision requires a single decoder device")
+        prepared = prepare_prompt(body["messages"], self.server.tok, self.server.template, limits=self.server.image_limits,
+                                  device=device, tools=body.get("tools"), template_kwargs=options, max_context=self.server.model.max_context)
+        ids = list(prepared.tokens)
+        starts_reasoning = prepared.starts_reasoning
+      else:
+        messages = copy.deepcopy(body["messages"])
+        normalize_messages(messages)
+        rendered = self.server.template.render(messages=messages, tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True)
+        ids = self.server.tok.encode(rendered)
+        starts_reasoning = rendered.rstrip().endswith("<think>")
+    except (ImageInputError, ValueError, TypeError, KeyError, RecursionError) as exc:
+      status = exc.status if isinstance(exc, ImageInputError) else 400
+      return self.send_data(json.dumps({"error":{"message":str(exc), "type":"invalid_request_error", "param":"messages"}}).encode(),
+                            status_code=status)
+    if DEBUG >= 1: print(f"prepared {len(ids)} tokens")
     if self.path == "/v1/chat/completions":
-      # render and tokenize
-      normalize_messages(body["messages"])
-      rendered = self.server.template.render(messages=body["messages"], tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True)
-      ids: list[int] = self.server.tok.encode(rendered)
       stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  ")
       if len(ids) >= self.server.model.max_context:
         stderr_log(f"{colored('context length exceeded', 'red')}  in:{len(ids):5d}  max:{self.server.model.max_context:5d}\n")
@@ -138,15 +237,34 @@ class Handler(VizHandler):
           f"{self.server.model.max_context}", "type":"invalid_request_error", "param":"messages", "code":"context_length_exceeded"}}).encode(),
           status_code=400)
 
+      embeddings = None
+      if prepared is not None and prepared.pixel_values is not None:
+        from tinygrad.llm.multimodal import embed_prompt
+        try: embeddings = embed_prompt(self.server.model, self.server.vision, prepared)
+        except Exception:
+          return self.send_data(json.dumps({"error":{"message":"vision inference failed", "type":"server_error"}}).encode(), status_code=500)
       # reply
-      max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
-      chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
+      max_tokens = body.get("max_completion_tokens")
+      if max_tokens is None: max_tokens = body.get("max_tokens")
+      if self.server.max_output_tokens is not None:
+        max_tokens = min(max_tokens or self.server.max_output_tokens, self.server.max_output_tokens)
+      chunks = self.run_model(prepared if prepared is not None else ids, body["model"],
+                              not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
                               max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
-                              reasoning=rendered.rstrip().endswith("<think>"))
-      if body.get("stream"): self.stream_json(chunks)
+                              reasoning=starts_reasoning, embeddings=embeddings)
+      if body.get("stream"):
+        def guarded_stream():
+          try: yield from chunks
+          except Exception: yield {"error":{"message":"generation failed", "type":"server_error"}}
+          finally: chunks.close()
+        self.stream_json(guarded_stream())
       else:
+        try: results = list(chunks)
+        except Exception:
+          return self.send_data(json.dumps({"error":{"message":"generation failed", "type":"server_error"}}).encode(), status_code=500)
+        finally: chunks.close()
         out, reasoning, tool_calls, finish_reason = [], [], [], "stop"
-        for c in chunks:
+        for c in results:
           if not c["choices"]: continue
           choice = c["choices"][0]
           if (delta := choice.get("delta", {})):
@@ -163,6 +281,11 @@ class Handler(VizHandler):
       raise RuntimeError(f"unhandled path {self.path}")
 
 class LLMServer(TCPServerWithReuse):
-  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any):
+  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any,
+               *, vision=None, image_limits=None, max_output_tokens:int|None=None):
+    if max_output_tokens is not None and (type(max_output_tokens) is not int or max_output_tokens <= 0):
+      raise ValueError("max_output_tokens must be positive")
     self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
+    self.vision, self.image_limits = vision, image_limits
+    self.max_output_tokens = 256 if vision is not None and max_output_tokens is None else max_output_tokens
     super().__init__(server_address, Handler)

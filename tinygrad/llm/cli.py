@@ -138,7 +138,7 @@ class FallbackTemplate:
 
 from tinygrad.llm.serve import LLMServer
 
-def main():
+def parse_args(argv:list[str]|None=None):
   parser = argparse.ArgumentParser()
   parser.add_argument("--model", "-m", default=list(models.keys())[0], help=f"Model choice ({', '.join(models.keys())}) or path to a local GGUF file")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
@@ -146,11 +146,48 @@ def main():
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
   parser.add_argument("--no_chat_template", action="store_true", help="Don't use the model's chat template, always use the fallback template")
-  args = parser.parse_args()
+  parser.add_argument("--vision-dir", type=str, help="Directory containing the pinned Qwen3.8 visual bundle")
+  parser.add_argument("--image", action="append", default=[], help="Local PNG/JPEG image for a one-shot prompt (repeatable)")
+  parser.add_argument("--prompt", help="One-shot text question for --image")
+  parser.add_argument("--max-output-tokens", type=int, help="Output cap (default 256 for vision, uncapped legacy text)")
+  parser.add_argument("--image-max-pixels", type=int, default=262144)
+  parser.add_argument("--max-images", type=int, default=4)
+  parser.add_argument("--max-visual-tokens", type=int, default=1024)
+  args = parser.parse_args(argv)
+  if args.max_context <= 0 or (args.max_output_tokens is not None and args.max_output_tokens <= 0):
+    parser.error("context and output limits must be positive")
+  if bool(args.image) != (args.prompt is not None): parser.error("--image and --prompt must be supplied together")
+  if args.image and (args.serve is not None or args.benchmark is not None): parser.error("one-shot images conflict with serving/benchmark")
+  if args.image and not args.vision_dir: parser.error("--image requires --vision-dir")
+  if args.vision_dir:
+    from tinygrad.llm.multimodal import ImageLimits
+    try: ImageLimits(max_pixels=args.image_max_pixels, max_images=args.max_images, max_visual_tokens=args.max_visual_tokens)
+    except ValueError as exc: parser.error(str(exc))
+    if args.no_chat_template: parser.error("vision requires the verified chat template")
+    if len(args.image) > args.max_images: parser.error("image count limit exceeded")
+    if args.max_output_tokens is None: args.max_output_tokens = 256
+  elif args.max_output_tokens is not None and args.serve is None:
+    parser.error("--max-output-tokens requires --serve or --vision-dir")
+  return args
 
+def main():
+  args = parse_args()
   # load the model
+  model_path = fetch(models.get(args.model, args.model))
+  vision = image_limits = None
+  if args.vision_dir:
+    from pathlib import Path
+    from tinygrad.llm.vision import validate_vision_bundle, validate_vision_metadata, load_vision
+    from tinygrad.llm.multimodal import ImageLimits
+    verified = validate_vision_bundle(Path(args.vision_dir), model_path)
+    image_limits = ImageLimits(max_pixels=args.image_max_pixels, max_images=args.max_images, max_visual_tokens=args.max_visual_tokens)
   with Context(DEBUG=max(DEBUG.value, 2 if args.serve else 0)):
-    model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context)
+    model, kv = Transformer.from_gguf(model_path, args.max_context)
+  if args.vision_dir:
+    validate_vision_metadata(kv)
+    vision_device = model.token_embd.weight.device
+    if not isinstance(vision_device, str): raise ValueError("vision requires a single decoder device")
+    vision = load_vision(Path(args.vision_dir), device=vision_device)
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
   file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
   print(f"using model \"{model_name}\" with {sum(file_sizes):,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params, "
@@ -161,24 +198,49 @@ def main():
 
   # use the model's chat template if jinja2 is available (enables model-specific formatting)
   template: jinja2.Template|FallbackTemplate = FallbackTemplate(tok)
-  if not args.no_chat_template and (ct := kv.get('tokenizer.chat_template')) is not None:
+  ct = verified["chat_template.jinja"].decode("utf-8") if args.vision_dir else kv.get('tokenizer.chat_template')
+  if not args.no_chat_template and ct is not None:
     try:
       import jinja2
-      env = jinja2.Environment()
+      env = jinja2.Environment(trim_blocks=bool(args.vision_dir), lstrip_blocks=bool(args.vision_dir))
       env.filters['tojson'] = lambda obj, **kwargs: json.dumps(obj, **kwargs)  # jinja2's tojson escapes <>& for HTML safety
       env.globals['raise_exception'] = lambda msg: (_ for _ in ()).throw(RuntimeError(msg))
       env.globals['strftime_now'] = lambda fmt: time.strftime(fmt)
       env.globals['bos_token'] = tok.decode([tok.bos_id]) if tok.bos_id is not None else ""
       env.globals['eos_token'] = tok.decode([tok.eos_id])
       template = env.from_string(ct)
-    except ImportError: print("warning: jinja2 is not installed, the model's chat template is disabled")
+    except ImportError:
+      if args.vision_dir: raise RuntimeError("vision requires tinygrad[vision]") from None
+      print("warning: jinja2 is not installed, the model's chat template is disabled")
+
+  if args.image:
+    from tinygrad.llm.multimodal import ImageLimits, prepare_prompt, embed_prompt, local_image_url
+    assert vision is not None and isinstance(image_limits, ImageLimits)
+    content = [{"type":"image_url", "image_url":{"url":local_image_url(Path(path), image_limits)}} for path in args.image]
+    content.append({"type":"text", "text":args.prompt})
+    assert isinstance(vision_device, str)
+    prompt = prepare_prompt([{"role":"user", "content":content}], tok, template, limits=image_limits,
+                            device=vision_device, max_context=model.max_context)
+    embeddings = embed_prompt(model, vision, prompt)
+    gen = model.generate(list(prompt.tokens), inputs_embeds=embeddings, position_ids=prompt.position_ids, rope_delta=prompt.rope_delta)
+    dec = tok.stream_decoder()
+    try:
+      for _, next_id in zip(range(min(args.max_output_tokens, model.max_context-len(prompt.tokens))), gen):
+        if tok.is_end(next_id): break
+        sys.stdout.write(dec(next_id))
+        sys.stdout.flush()
+      sys.stdout.write(dec()+"\n")
+    finally: gen.close()
+    return
 
   # warmup the JIT
   if args.warmup or args.serve:
     with Context(DEBUG=max(DEBUG.value, 1)): model.warmup()
 
   # start server
-  if args.serve: LLMServer(('', args.serve), model, model_name, tok, template).serve_forever()
+  if args.serve:
+    LLMServer(('', args.serve), model, model_name, tok, template, vision=vision, image_limits=image_limits,
+              max_output_tokens=args.max_output_tokens).serve_forever()
 
   # do benchmark
   if args.benchmark is not None:

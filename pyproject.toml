@@ -25,6 +25,7 @@ packages = [
   'tinygrad.codegen.late',
   'tinygrad.engine',
   'tinygrad.llm',
+  'tinygrad.llm.kernels',
   'tinygrad.mixin',
   'tinygrad.nn',
   'tinygrad.renderer',
@@ -55,6 +56,7 @@ tinygrad = ["py.typed"]
 
 
 [project.optional-dependencies]
+vision = ["pillow", "numpy", "jinja2"]
 # arm = ["unicorn"]
 # triton = ["triton-nightly>=2.1.0.dev20231014192330"]
 linting = [
@@ -78,7 +80,7 @@ testing_minimal = [
   "hypothesis>=6.148.9",
   "z3-solver<4.15.4",  # 4.15.4 has a segfault when creating many z3.Context()
 ]
-testing_unit = ["tinygrad[testing_minimal]", "tqdm", "safetensors", "tabulate", "openai", "gguf>=0.18", "capstone"]
+testing_unit = ["tinygrad[testing_minimal]", "tqdm", "safetensors", "tabulate", "openai", "gguf>=0.18", "capstone", "pillow", "jinja2"]
 testing = [
   "tinygrad[testing_unit]",
   "pillow",

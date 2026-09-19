@@ -1,5 +1,5 @@
 from __future__ import annotations
-import enum, functools, itertools, pathlib
+import enum, functools, itertools, math, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
@@ -31,6 +31,17 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   cos, sin = freqs_cis.reshape(1, 1, x.shape[2], -1).chunk(2, dim=-1)
   x1, x2 = x.chunk(2, dim=-1)
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
+
+def multimodal_freqs_cis(position_ids:Tensor, dim:int, theta:float, sections:tuple[int, ...]) -> Tensor:
+  # Interleaved T/H/W frequencies: H occupies 1,4,... and W 2,5,...; remaining frequencies use T.
+  if len(sections) != 3 or any(s <= 0 for s in sections) or sum(sections)*2 != dim:
+    raise ValueError("mRoPE sections must contain three positive counts summing to half the rotary dimension")
+  idx = Tensor.arange(dim//2).to(position_ids.device)
+  positions = position_ids.float().squeeze(1).unsqueeze(-1)
+  freqs = ((idx % 3 == 1) & (idx < 3*sections[1])).where(positions[1],
+    ((idx % 3 == 2) & (idx < 3*sections[2])).where(positions[2], positions[0]))
+  angles = freqs * (1.0 / (theta ** (idx.float() * 2 / dim)))
+  return angles.cos().cat(angles.sin(), dim=-1)
 
 def pairwise_topk(x: Tensor, k: int) -> tuple[Tensor, Tensor]:
   n = x.shape[-1]
@@ -80,6 +91,7 @@ class TransformerConfig:
   routed_scaling_factor: float = 1.0
   qkv_bias: bool = False
   expert_bias: bool = False
+  rope_sections: tuple[int, ...] = (11, 11, 10)
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -141,14 +153,16 @@ class FFNBlock:
   def _init_state(self, x:Tensor): raise NotImplementedError
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor: raise NotImplementedError
 
-  def __call__(self, x: Tensor, start_pos: int|UOp):
+  def __call__(self, x: Tensor, start_pos: int|UOp, position_ids:Tensor|None=None):
     self._init_state(x)
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
-    def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + self._attention(self.attn_norm(x), start_pos)
+    def _run(x:Tensor, start_pos:int|UOp, position_ids:Tensor|None=None):
+      attn = self._attention(self.attn_norm(x), start_pos, position_ids) if isinstance(self, TransformerBlock) and position_ids is not None \
+        else self._attention(self.attn_norm(x), start_pos)
+      h = x + attn
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
-    return _run(x, start_pos)
+    return _run(x, start_pos) if position_ids is None else _run(x, start_pos, position_ids)
 
 class TransformerBlock(FFNBlock):
   def __init__(self, config:TransformerConfig):
@@ -164,7 +178,7 @@ class TransformerBlock(FFNBlock):
     self.attn_output = Linear(config.head_dim * config.n_heads, config.dim, bias=False)
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
 
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+  def _attention(self, x:Tensor, start_pos:int|UOp, position_ids:Tensor|None=None) -> Tensor:
     q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
@@ -177,8 +191,10 @@ class TransformerBlock(FFNBlock):
     v = v.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     if self.config.qk_norm == self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
-    q = apply_rope(q[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(q[..., self.config.rope_dim:], dim=-1)
-    k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
+    freqs = self.freqs_cis[start_pos:start_pos+T] if position_ids is None else \
+      multimodal_freqs_cis(position_ids, self.config.rope_dim, self.config.rope_theta, self.config.rope_sections)
+    q = apply_rope(q[..., :self.config.rope_dim], freqs).cat(q[..., self.config.rope_dim:], dim=-1)
+    k = apply_rope(k[..., :self.config.rope_dim], freqs).cat(k[..., self.config.rope_dim:], dim=-1)
 
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
     store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)
@@ -281,7 +297,7 @@ class GatedDeltaNetBlock(FFNBlock):
     B, T, _ = x.shape
     # bind ints to a variable so the reset flag stays a runtime value (it toggles when generation restarts at position 0)
     start_pos = start_pos if isinstance(start_pos, UOp) else UOp.variable("start_pos", 0, self.config.max_context-1).bind(start_pos)
-    initial = Tensor(start_pos).eq(0)
+    initial = Tensor(start_pos, device=x.device).eq(0)
     is_kda = hasattr(self, "ssm_g_a")
     symbolic = isinstance(T, UOp)
     T_pad = x.max_shape[1]  # symbolic chunks are padded to their max size: one graph serves every size
@@ -299,7 +315,7 @@ class GatedDeltaNetBlock(FFNBlock):
     conv_state = initial.where(0, self.conv_state)
     # assemble the conv window in a static-size buffer: [conv_state | qkv rows | zero-pad].
     # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
-    win = Tensor.zeros(B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels).uop
+    win = Tensor.zeros(B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels, device=x.device).uop
     win = win.after(win[:, :self.ssm_conv_kernel-1].store(conv_state.cast(win.dtype).uop))
     win = win.after(win[:, self.ssm_conv_kernel-1:self.ssm_conv_kernel-1+T].store(self.attn_qkv(x).cast(win.dtype).uop))
     conv_window = Tensor(win)
@@ -312,8 +328,9 @@ class GatedDeltaNetBlock(FFNBlock):
       out_gate = out_gate.pad_to((B, T_pad, self.num_v_heads, self.head_v_dim))
       beta, log_alpha = beta.pad_to((B, T_pad, self.num_v_heads)), log_alpha.pad_to((B, T_pad, *log_alpha.shape[2:]))
     q, k, v = conv_out.split([self.q_dim, self.q_dim, self.conv_channels - 2*self.q_dim], dim=-1)
-    qk_eps = 1e-12 if is_kda else 1e-6
-    q, k = (z.reshape(B, T_pad, self.num_k_heads, self.head_k_dim).normalize(dim=-1, eps=qk_eps)
+    q, k = (z.reshape(B, T_pad, self.num_k_heads, self.head_k_dim) for z in (q, k))
+    # GDN uses FLA/HF l2norm: epsilon inside rsqrt, not normalize's clamp after sqrt. Keep KDA's original normalization.
+    q, k = ((z.normalize(dim=-1, eps=1e-12) if is_kda else z * (z.square().sum(-1, keepdim=True) + 1e-6).rsqrt())
             .repeat(1, 1, self.num_v_heads//self.num_k_heads, 1) for z in (q, k))
     v = v.reshape(B, T_pad, self.num_v_heads, self.head_v_dim)
     # layout the per-step operands to broadcast against the (B, H, V, K) state
@@ -325,7 +342,7 @@ class GatedDeltaNetBlock(FFNBlock):
     state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
     if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3)
-      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
+      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos, device=x.device)).transpose(1, 2)
     else:
       q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
       alpha = alpha.unsqueeze(-1)
@@ -368,14 +385,36 @@ class Transformer:
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
+    self.multimodal_rollout_jit = TinyJit(self._multimodal_decode)
+    self._generation_epoch = 0
+    self._multimodal_active = False
 
-  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    x = self.token_embd(tokens).float()                   # (B, T, D)
-    for block in self.blk: x = block(x, start_pos)
+  def forward_embeddings(self, x:Tensor, start_pos:int|UOp, position_ids:Tensor|None=None) -> Tensor:
+    if position_ids is not None:
+      if x.ndim != 3 or x.shape[0] != 1 or x.shape[2] != self.token_embd.weight.shape[1] or x.dtype != dtypes.float32:
+        raise ValueError("multimodal embeddings must be float32 [1, L, decoder_dim]")
+      physical = start_pos if isinstance(start_pos, int) else start_pos.unbind()[1]
+      if not 0 <= physical < physical+x.shape[1] <= self.max_context: raise ValueError("physical positions must fit the context")
+      if position_ids.shape != (3, 1, x.shape[1]) or position_ids.dtype != dtypes.int32:
+        raise ValueError("position_ids must be int32 [3, 1, L]")
+      if position_ids.device != x.device or x.device != self.token_embd.weight.device:
+        raise ValueError("embeddings and positions must be on the decoder device")
+      if any(isinstance(b, MLATransformerBlock) for b in self.blk): raise ValueError("mRoPE is not supported for MLA")
+    for block in self.blk:
+      x = block(x, start_pos, position_ids) if position_ids is not None and isinstance(block, TransformerBlock) else block(x, start_pos)
     # only run the output projection on the last token
-    logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
+    return self.output(self.output_norm(x[:, -1:]))[:, -1, :]
+
+  @staticmethod
+  def _sample(logits:Tensor, temperature:Tensor) -> Tensor:
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+
+  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+    return self._sample(self.forward_embeddings(self.token_embd(tokens).float(), start_pos), temperature)
+
+  def _multimodal_decode(self, tokens:Tensor, start_pos:UOp, position_ids:Tensor, temperature:Tensor) -> Tensor:
+    return self._sample(self.forward_embeddings(self.token_embd(tokens).float(), start_pos, position_ids), temperature)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
@@ -475,7 +514,73 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
+  def reset_generation_state(self):
+    # Position zero resets GDN and overwrites the valid KV prefix. Never replace buffers captured by a JIT.
+    self._cached_tokens = []
+    self._generation_epoch += 1
+    self._multimodal_active = False
+
+  def _generate_multimodal(self, tokens:list[int], chunk_size:int, temperature:float,
+                           inputs_embeds:Tensor|None, position_ids:Tensor|None, rope_delta:int):
+    self.reset_generation_state()
+    epoch = self._generation_epoch
+    self._multimodal_active = True
+    try:
+      length, device = len(tokens), self.token_embd.weight.device
+      if not isinstance(inputs_embeds, Tensor) or not isinstance(position_ids, Tensor):
+        raise ValueError("multimodal generation requires embeddings and positions tensors together")
+      if not 0 < length <= self.max_context: raise ValueError("multimodal prompt must fit the context")
+      if inputs_embeds.shape != (1, length, self.token_embd.weight.shape[1]) or inputs_embeds.dtype != dtypes.float32:
+        raise ValueError("inputs_embeds must be float32 [1, prompt_length, decoder_dim]")
+      if position_ids.shape != (3, 1, length) or position_ids.dtype != dtypes.int32:
+        raise ValueError("position_ids must be int32 [3, 1, prompt_length]")
+      if inputs_embeds.device != device or position_ids.device != device:
+        raise ValueError("embeddings and positions must be on the decoder device")
+      if type(chunk_size) is not int or chunk_size <= 0: raise ValueError("chunk_size must be positive")
+      try: valid_temperature = type(temperature) in (float, int) and math.isfinite(temperature) and temperature >= 0
+      except OverflowError: valid_temperature = False
+      if not valid_temperature: raise ValueError("temperature must be finite and nonnegative")
+      if type(rope_delta) is not int or not 0 <= length+rope_delta <= self.max_context+rope_delta < 2**31:
+        raise ValueError("invalid rope_delta")
+      if any(type(t) is not int or not 0 <= t < self.token_embd.weight.shape[0] for t in tokens): raise ValueError("invalid token ID")
+      # Value checks are request-boundary work, never copyouts inside the decode JIT.
+      if not inputs_embeds.isfinite().all().item() or not (position_ids >= 0).all().item():
+        raise ValueError("embeddings must be finite and coordinates nonnegative")
+      if int(position_ids.max().item())+1-length != rope_delta: raise ValueError("rope_delta does not match prompt coordinates")
+      if length == self.max_context: return
+      temp = Tensor([temperature], dtype=dtypes.float32, device=device).realize()
+      # Eager bounded chunks also on CPU GDN; unlike text prefill, do not force token-serial processing.
+      chunk_size = min(chunk_size, 32)
+      physical = UOp.variable("start_pos", 0, self.max_context-1)
+      for start in range(0, length, chunk_size):
+        end = min(start+chunk_size, length)
+        logits = self.forward_embeddings(inputs_embeds[:, start:end].contiguous(), physical.bind(start),
+                                         position_ids[:, :, start:end].contiguous()).realize()
+      out = self._sample(logits, temp).realize()
+      # Owned, realized buffers keep identical dtype/view/device signatures across requests and JIT replay.
+      token = Tensor.empty(1, 1, dtype=dtypes.int32, device=device).realize()
+      coords = Tensor.empty(3, 1, 1, dtype=dtypes.int32, device=device).realize()
+      while length < self.max_context:
+        tokens.append(int(out.item()))
+        yield tokens[-1]
+        if epoch != self._generation_epoch: return
+        if length+1 == self.max_context: return
+        token.assign(Tensor([[tokens[-1]]], dtype=dtypes.int32, device=device)).realize()
+        coords.assign(Tensor.full((3, 1, 1), length+rope_delta, dtype=dtypes.int32, device=device)).realize()
+        out = self.multimodal_rollout_jit(token, physical.bind(length), coords, temp).realize()
+        length += 1
+    finally:
+      # A retained old iterator must not reset a newer request's live state when it is eventually closed.
+      if epoch == self._generation_epoch: self.reset_generation_state()
+
+  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, *,
+               inputs_embeds:Tensor|None=None, position_ids:Tensor|None=None, rope_delta:int=0):
+    if inputs_embeds is not None or position_ids is not None or rope_delta != 0:
+      yield from self._generate_multimodal(tokens, chunk_size, temperature, inputs_embeds, position_ids, rope_delta)
+      return
+    if self._multimodal_active: self.reset_generation_state()
+    self._generation_epoch += 1
+    epoch = self._generation_epoch
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
@@ -496,3 +601,4 @@ class Transformer:
       tokens.append(int(out.item()))
       self._cached_tokens = tokens[:-1]
       yield tokens[-1]
+      if epoch != self._generation_epoch: return
