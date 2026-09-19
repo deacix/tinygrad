@@ -14,6 +14,10 @@ tinygrad supports various runtimes, enabling your code to scale across a wide ra
 | [WEBGPU](https://github.com/tinygrad/tinygrad/tree/master/tinygrad/runtime/ops_webgpu.py) | Runs on GPU using the Dawn WebGPU engine (used in Google Chrome) | - | Dawn library installed and discoverable. Binaries: [pydawn v0.3.0](https://github.com/wpmed92/pydawn/releases/tag/v0.3.0) |
 
 
+## Experimental LLM layer placement
+
+The [layer-partitioned LLM guide](llm_multidevice.md) describes explicit owner-local GGUF loading and serialized serving. Its CPU-only acceptance tests do not certify physical multi-eGPU compatibility, memory fit or performance.
+
 ## Interoperability
 
 tinygrad provides interoperability with OpenCL and PyTorch, allowing efficient tensor data sharing between frameworks through the `Tensor.from_blob` API. This enables zero-copy operations by working directly with external memory pointers.
