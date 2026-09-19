@@ -1,5 +1,5 @@
 """Mandatory CPU logical-device execution tests. No downloads or GPU availability skips."""
-import dataclasses, gc, struct, weakref, threading
+import dataclasses, functools, gc, struct, weakref, threading
 from unittest.mock import patch
 import numpy as np
 import pytest
@@ -26,11 +26,16 @@ def reference(values, *, dim=32, blocks=4, half=0, context=32):
   return ref
 
 
-def load_pair(tmp_path, counts=(1,3), mode='host', half=0, chunk=4, context=32, **kwargs):
+def load_placed(tmp_path, counts=(1,3), mode='host', half=0, chunk=4, context=32, **kwargs):
   path, values = save_llama(tmp_path, **kwargs)
   devices = tuple('CPU' if i == 0 else f'CPU:{i}' for i in range(len(counts)))
   with patch.object(mm,'getenv',return_value=half):
     model, _ = Transformer.from_gguf(path,context,False,placement=LayerPlacement(devices,counts,mode,chunk))
+  return model, values
+
+
+def load_pair(tmp_path, counts=(1,3), mode='host', half=0, chunk=4, context=32, **kwargs):
+  model, values = load_placed(tmp_path,counts,mode,half,chunk,context,**kwargs)
   return model, reference(values,dim=kwargs.get('dim',32),blocks=sum(counts),half=half,context=context)
 
 
@@ -47,16 +52,60 @@ def placed_logits(model, ids, pos, *, jit=False):
     return model._placed_step(tokens,pos,jit=jit,owner=owner).numpy().copy()
 
 
-def assert_parity(model, ref, actual, expected, valid, *, half=False):
+def assert_snapshot(model, actual, expected, kv, valid, *, half=False):
   atol, rtol = (3e-3,3e-3) if half else (1e-5,1e-4)
   np.testing.assert_allclose(actual,expected,rtol=rtol,atol=atol,
                              err_msg=f'logits max error {np.max(np.abs(actual-expected))}')
   assert np.max(np.abs(expected)) > 1e-3 and np.isfinite(expected).all()
-  for i,(a,b) in enumerate(zip(model.blk,ref.blk)):
+  assert len(model.blk) == len(kv)
+  for i,(a,bv) in enumerate(zip(model.blk,kv)):
     av = a.cache_kv.numpy()[:, :, :, :valid, :].copy()
-    bv = b.cache_kv.numpy()[:, :, :, :valid, :].copy()
     np.testing.assert_allclose(av,bv,rtol=rtol,atol=atol,err_msg=f'block {i} KV max error {np.max(np.abs(av-bv))}')
     assert np.max(np.abs(bv)) > 1e-3
+
+
+def assert_parity(model, ref, actual, expected, valid, *, half=False):
+  assert_snapshot(model,actual,expected,tuple(b.cache_kv.numpy()[:, :, :, :valid, :].copy() for b in ref.blk),valid,half=half)
+
+
+@functools.lru_cache(maxsize=32)
+def reference_trajectory(steps, *, dim=32, blocks=4, half=0, context=32, typ=0, tied=True):
+  # Cache only immutable CPU oracle snapshots, keyed by the full fixture and ordered chunk history.
+  # Every placement/mode/JIT combination still loads a fresh model and executes every original step/assertion.
+  _, _, values = llama_fixture(dim=dim,blocks=blocks,typ=typ,tied=tied)
+  ref = reference(values,dim=dim,blocks=blocks,half=half,context=context)
+  snapshots = []
+  for pos,ids in steps:
+    logits = ref_step(ref,ids,pos)
+    kv = tuple(b.cache_kv.numpy()[:, :, :, :pos+len(ids), :].copy() for b in ref.blk)
+    for array in (logits,*kv): array.flags.writeable = False
+    snapshots.append((logits,kv))
+  return tuple(snapshots)
+
+
+class TestReferenceTrajectory:
+  @pytest.mark.parametrize('half,typ,tied', [(0,0,True),(1,1,False)])
+  def test_cached_snapshots_match_fresh_history(self,tmp_path,half,typ,tied):
+    steps = ((0,(3,5,7,9)),(4,(11,13)),(6,(15,)))
+    reference_trajectory.cache_clear()
+    snapshots = reference_trajectory(steps,half=half,typ=typ,tied=tied)
+    assert len(snapshots) == len(steps)
+    assert reference_trajectory(steps,half=half,typ=typ,tied=tied) is snapshots
+    _, values = load_placed(tmp_path,half=half,typ=typ,tied=tied)
+    ref = reference(values,half=half)
+    for (pos,ids),(logits,kv) in zip(steps,snapshots):
+      np.testing.assert_array_equal(logits,ref_step(ref,ids,pos))
+      assert len(kv) == len(ref.blk)
+      for array,block in zip(kv,ref.blk):
+        np.testing.assert_array_equal(array,block.cache_kv.numpy()[:, :, :, :pos+len(ids), :])
+      for array in (logits,*kv):
+        assert array.base is None and not array.flags.writeable
+        with pytest.raises(ValueError): array.flat[0] = 0
+    # A different prior chunk with the same last input must not reuse stale KV expectations.
+    changed = ((0,(4,6,8,10)),*steps[1:])
+    other = reference_trajectory(changed,half=half,typ=typ,tied=tied)
+    assert other is not snapshots and not np.array_equal(other[-1][0],snapshots[-1][0])
+    assert not hasattr(snapshots,'uop') and all(isinstance(a,np.ndarray) for logits,kv in snapshots for a in (logits,*kv))
 
 
 class TestPlacedExecution:
@@ -65,13 +114,12 @@ class TestPlacedExecution:
   @pytest.mark.parametrize('length', [1,4,5,6,7,8,9])
   @pytest.mark.parametrize('jit', [False,True])
   def test_logits_and_every_valid_kv(self,tmp_path,counts,mode,length,jit):
-    model, ref = load_pair(tmp_path,counts,mode)
+    model, _ = load_placed(tmp_path,counts,mode)
     ids = [(i*7+3)%32 for i in range(length)]
-    for pos in range(0,length,4):
-      chunk = ids[pos:pos+4]
+    steps = tuple((pos,tuple(ids[pos:pos+4])) for pos in range(0,length,4))
+    for (pos,chunk),(expected,kv) in zip(steps,reference_trajectory(steps),strict=True):
       actual = placed_logits(model,chunk,pos,jit=jit)
-      expected = ref_step(ref,chunk,pos)
-      assert_parity(model,ref,actual,expected,pos+len(chunk))
+      assert_snapshot(model,actual,expected,kv,pos+len(chunk))
 
   @pytest.mark.parametrize('mode', ['host','native'])
   def test_owner_state_and_boundary_only_copies(self,tmp_path,mode):
@@ -158,19 +206,21 @@ class TestPlacedExecution:
   @pytest.mark.parametrize('warmup', [False,True])
   def test_coordinator_uploads_retain_sources_until_sync(self,tmp_path,counts,warmup):
     from contextlib import ExitStack
-    model, _ = load_pair(tmp_path,counts=counts,chunk=1)
+    model, _ = load_placed(tmp_path,counts=counts,chunk=1)
     last = model.placement.devices[-1]
     logits = Tensor.zeros(1,32,device=last).contiguous().realize()
     sampled = Tensor([[3]],dtype=dtypes.int32,device=last).realize()
     pending, completed = [], []
-    copy, frompy, init = UOp.copy_to_device, UOp._frompy, Tensor.__init__
+    copy, frompy, init = Tensor.to, UOp._frompy, Tensor.__init__
     def construct(tensor,data,*args,**kwargs):
       if isinstance(data,(list,tuple,bytes)):
         assert kwargs.get('device') == 'PYTHON', 'coordinator must retain an explicit host source before uploading'
       init(tensor,data,*args,**kwargs)
     def capture(src,device,*args,**kwargs):
       if src.device == 'PYTHON' and device in model.placement.devices:
-        roots = buffer_roots(Tensor(src))
+        # Observe the actual upload Tensor, not UOp.copy_to_device: SPEC=2 also calls the latter
+        # while reconstructing abstract graphs in test_pyrender, where there is no allocated source.
+        roots = buffer_roots(src)
         assert len(roots) == 1
         buf = next(iter(roots)).buffer
         pending.append((device,weakref.ref(buf),bytes(buf.host)))
@@ -199,7 +249,7 @@ class TestPlacedExecution:
         original = Device[device].synchronize
         stack.enter_context(patch.object(Device[device],'synchronize',lambda d=device,f=original: sync(d,f)))
       stack.enter_context(patch.object(Tensor,'__init__',construct))
-      stack.enter_context(patch.object(UOp,'copy_to_device',capture))
+      stack.enter_context(patch.object(Tensor,'to',capture))
       stack.enter_context(patch.object(UOp,'_frompy',allocate))
       stack.enter_context(patch.object(model,'_placed_step',step))
       stack.enter_context(patch.object(model,'_placed_sample',sample))
@@ -269,17 +319,16 @@ class TestPlacedJit:
   @pytest.mark.parametrize('mode', ['host','native'])
   @pytest.mark.parametrize('count', [1,4])
   def test_changing_inputs_eager_capture_two_replays(self,tmp_path,counts,mode,count):
-    model, ref = load_pair(tmp_path,counts,mode)
+    model, _ = load_placed(tmp_path,counts,mode)
     state = nn.state.get_state_dict(model)
     kv_ids = [(id(b.cache_kv),buffer_roots(b.cache_kv)) for b in model.blk]
     snapshots = []
+    steps = tuple((step*count,tuple((3+step*5+i*7)%32 for i in range(count))) for step in range(4))
     with patch.object(model,'prefill_jit',side_effect=AssertionError('nested JIT')), \
          patch.object(model,'rollout_jit',side_effect=AssertionError('nested JIT')):
-      for step in range(4):
-        ids = [(3+step*5+i*7)%32 for i in range(count)]
-        actual = placed_logits(model,ids,step*count,jit=True)
-        expected = ref_step(ref,ids,step*count)
-        assert_parity(model,ref,actual,expected,(step+1)*count)
+      for (pos,ids),(expected,kv) in zip(steps,reference_trajectory(steps),strict=True):
+        actual = placed_logits(model,ids,pos,jit=True)
+        assert_snapshot(model,actual,expected,kv,pos+count)
         snapshots.append(actual)
     assert not np.array_equal(snapshots[0],snapshots[-1])
     assert kv_ids == [(id(b.cache_kv),buffer_roots(b.cache_kv)) for b in model.blk]
@@ -399,7 +448,7 @@ class TestLegacyPublicPlacementIsolation:
 # Lifecycle tests use public entrypoints, never a private step to bypass ownership.
 class TestPlacedLifecycle:
   def test_direct_admission_race_has_no_unowned_input_reads(self,tmp_path):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     tokens = Tensor([[3]],dtype=dtypes.int32,device='CPU').realize()
     temp = Tensor([0.],dtype=dtypes.float32,device='CPU:1').realize()
     checked, proceed = threading.Event(), threading.Event()
@@ -445,7 +494,7 @@ class TestPlacedLifecycle:
     assert not thread.is_alive() and model._placed.state == 'ready'
 
   def test_clean_close_competitors_and_reset(self,tmp_path):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     gen = model.generate([3,1,9,7,2])
     first = next(gen)
     assert model._placed.state == 'generating' and model._cached_tokens == [3,1,9,7,2]
@@ -510,7 +559,7 @@ class TestPlacedLifecycle:
   @pytest.mark.parametrize('kind', ['stage','copy','sample','brokenpipe','resetpipe','unexpected'])
   @pytest.mark.parametrize('mode', ['host','native'])
   def test_owned_failure_is_sanitized_and_requires_reload(self,tmp_path,kind,mode):
-    model, _ = load_pair(tmp_path,mode=mode)
+    model, _ = load_placed(tmp_path,mode=mode)
     failure = BrokenPipeError('private backend detail') if kind == 'brokenpipe' else \
       ConnectionResetError('private backend detail') if kind == 'resetpipe' else RuntimeError('private backend detail')
     original = mm._LayerStage.run
@@ -530,7 +579,7 @@ class TestPlacedLifecycle:
     if kind != 'unexpected': assert np.any(model.blk[0].cache_kv.numpy() != 0)
     for attempt in (lambda: next(model.generate([2])),model.reset_generation_state,model.warmup):
       with pytest.raises(mm.PlacedModelUnavailableError): attempt()
-    fresh, _ = load_pair(tmp_path)
+    fresh, _ = load_placed(tmp_path)
     gen = fresh.generate([2])
     try: assert isinstance(next(gen),int)
     finally: gen.close()
@@ -561,7 +610,7 @@ class TestPlacedLifecycle:
   @pytest.mark.parametrize('kind', ['shape','dtype','owner','symbolic','empty','count','position','unbound','token',
                                    'temp_owner','temp_shape','temp_value'])
   def test_invalid_direct_inputs_do_not_mutate(self,tmp_path,entry,kind):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     model._cached_tokens = [3,1]
     tokens = Tensor([[3]],dtype=dtypes.int32,device='CPU')
     temp = Tensor([0.],dtype=dtypes.float32,device='CPU:1')
@@ -586,7 +635,7 @@ class TestPlacedLifecycle:
   @pytest.mark.parametrize('kwargs', [{'inputs_embeds':1},{'position_ids':1},{'rope_delta':1},{'chunk_size':3},
                                      {'temperature':-1},{'temperature':float('inf')}])
   def test_bad_generation_options_keep_active_owner(self,tmp_path,kwargs):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     gen = model.generate([3,1])
     next(gen)
     try:
@@ -597,7 +646,7 @@ class TestPlacedLifecycle:
     assert model._placed.state == 'ready'
 
   def test_public_multimodal_seams_rejected_and_configuration_frozen(self,tmp_path):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     tokens = Tensor([[3]],dtype=dtypes.int32,device='CPU')
     with pytest.raises(ValueError): model.forward_embeddings(tokens,0)
     with pytest.raises(ValueError): model._multimodal_decode(tokens,0,tokens,tokens)
@@ -637,7 +686,7 @@ class TestPlacedLifecycle:
   @pytest.mark.parametrize('entry', ['forward','call'])
   @pytest.mark.parametrize('kind', ['lazy_sample','sync','stage','interrupt'])
   def test_direct_mutation_failures_fail_closed(self,tmp_path,entry,kind):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     model._cached_tokens = [3,1]
     tokens = Tensor([[3]],dtype=dtypes.int32,device='CPU').realize()
     temp = Tensor([0.],dtype=dtypes.float32,device='CPU:1').realize()
@@ -665,7 +714,7 @@ class TestPlacedLifecycle:
     with pytest.raises(mm.PlacedModelUnavailableError): model(tokens,0,temp)
 
   def test_failure_after_committed_token_clears_prefix(self,tmp_path):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     gen = model.generate([3,1,9,7,2])
     next(gen)
     assert model._cached_tokens == [3,1,9,7,2]
@@ -676,13 +725,13 @@ class TestPlacedLifecycle:
 
   @pytest.mark.parametrize('tokens', [[],[32],[-1],[True],[1.0],list(range(32))+[0]])
   def test_invalid_prompt_keeps_prefix(self,tmp_path,tokens):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     model._cached_tokens = [3,1]
     with pytest.raises(ValueError): next(model.generate(tokens))
     assert model._cached_tokens == [3,1] and model._placed.state == 'ready'
 
   def test_partial_prefill_does_not_publish_prefix(self,tmp_path):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     model._cached_tokens = [20,21]
     original = model._placed_step
     calls = []
@@ -699,7 +748,7 @@ class TestPlacedLifecycle:
     assert model._cached_tokens == [] and model._placed.state == 'failed'
 
   def test_direct_transaction_clears_before_write_and_finishes_output_before_release(self,tmp_path):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     model._cached_tokens = [20,21]
     tokens = Tensor([[3]],dtype=dtypes.int32,device='CPU').realize()
     temp = Tensor([0.],dtype=dtypes.float32,device='CPU:1').realize()
@@ -718,7 +767,7 @@ class TestPlacedLifecycle:
     assert model._cached_tokens == [] and model._placed.state == 'ready' and not model._placed.lock.locked()
 
   def test_check_available_and_warmup_failure(self,tmp_path):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     assert model.check_available() is None
     with patch.object(mm._LayerStage,'run',side_effect=BrokenPipeError('private text')):
       with pytest.raises(mm.PlacedInferenceError): model.warmup()
@@ -726,7 +775,7 @@ class TestPlacedLifecycle:
     with pytest.raises(mm.PlacedModelUnavailableError): model.check_available()
 
   def test_unowned_backend_validation_failure_is_wrapped_but_not_poisoned(self,tmp_path):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     model._cached_tokens = [3,1]
     tokens = Tensor([[3]],dtype=dtypes.int32,device='CPU').realize()
     temp = Tensor([0.],dtype=dtypes.float32,device='CPU:1').realize()
@@ -736,7 +785,7 @@ class TestPlacedLifecycle:
     assert model._cached_tokens == [3,1] and model._placed.state == 'ready' and not model._placed.lock.locked()
 
   def test_caller_history_mutation_does_not_publish_invalid_prefix(self,tmp_path):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     tokens = [3,1,9]
     gen = model.generate(tokens)
     first = next(gen)
@@ -746,7 +795,7 @@ class TestPlacedLifecycle:
     assert model._cached_tokens == [3,1,9,first] and tokens == [12,1,9,first,second]
 
   def test_owned_unexpected_generator_exit_fails_not_clean_close(self,tmp_path):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     with patch.object(model,'_sample',side_effect=GeneratorExit):
       gen = model.generate([3])
       with pytest.raises(GeneratorExit): next(gen)

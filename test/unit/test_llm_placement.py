@@ -27,6 +27,8 @@ def llama_fixture(*, dim=32, blocks=4, tied=True, typ=0):
       ('attn_norm',(dim,)), ('attn_q',(dim,dim)), ('attn_k',(dim//2,dim)), ('attn_v',(dim//2,dim)),
       ('attn_output',(dim,dim)), ('ffn_norm',(dim,)), ('ffn_gate',(2*dim,dim)), ('ffn_up',(2*dim,dim)), ('ffn_down',(dim,2*dim))]})
   tensors, values = [], {}
+  # A fixture repeats only three independent packed blocks; build each once, not once per matrix block.
+  variants = [quant_block(typ,i) for i in range(3)] if typ not in (0,1,30) else []
   for name,shape in shapes.items():
     t = 0 if len(shape) == 1 else typ
     v = (1 + rng.uniform(-0.05,0.05,shape) if len(shape) == 1 else rng.uniform(-0.1,0.1,shape)).astype(np.float32)
@@ -38,11 +40,10 @@ def llama_fixture(*, dim=32, blocks=4, tied=True, typ=0):
       payload, v = bits.astype('<u2').tobytes(), (bits << 16).view(np.float32)
     else:
       # Rotate/scalewise vary whole independent blocks so a row permutation cannot accidentally be a no-op.
-      _, oracle = quant_block(t)
-      size = len(oracle)
+      size = len(variants[0][1])
       packed, rows = [], []
       for n in range(np.prod(shape)//size):
-        block, expected = quant_block(t,n % 3)
+        block, expected = variants[n % 3]
         if t in (2,8):
           scale = 1 + n % 3
           block = struct.pack('<e',struct.unpack('<e',block[:2])[0]*scale) + block[2:]
