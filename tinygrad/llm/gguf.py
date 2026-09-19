@@ -1,5 +1,5 @@
 import functools, io, os, pathlib, re, stat, struct, sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, BinaryIO, Callable
 
 from tinygrad.tensor import Tensor
@@ -242,41 +242,25 @@ def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
   return kv, sd
 
 # Checked, read-only path API. Deliberately separate from the legacy Tensor/DISK parser above.
+# Shape is in tinygrad order; offset is absolute, excluding alignment padding.
 @dataclass(frozen=True)
-class GGUFTensorInfo:
-  name: str
-  part: int
-  shape: tuple[int, ...]  # tinygrad order
-  ggml_type: int
-  offset: int  # absolute file offset, excluding alignment padding
-  nbytes: int
+class GGUFTensorInfo: name: str; part: int; shape: tuple[int, ...]; ggml_type: int; offset: int; nbytes: int  # noqa: E702
+
+# Identity: device, inode, size, mtime_ns.
+@dataclass(frozen=True)
+class GGUFPart: path: pathlib.Path; size: int; identity: tuple[int, int, int, int]  # noqa: E702
 
 @dataclass(frozen=True)
-class GGUFPart:
-  path: pathlib.Path
-  size: int
-  identity: tuple[int, int, int, int]  # device, inode, size, mtime_ns
-
-@dataclass(frozen=True)
-class GGUFIndex:
-  kv: dict
-  parts: tuple[GGUFPart, ...]
-  tensors: tuple[GGUFTensorInfo, ...]
+class GGUFIndex: kv: dict; parts: tuple[GGUFPart, ...]; tensors: tuple[GGUFTensorInfo, ...]  # noqa: E702
 
 # New-path implementation limits, not limits on the GGUF format or expanded Python object memory.
-_GGUF_MAX_METADATA = 256 << 20
-_GGUF_MAX_TENSORS = 1_000_000
-_GGUF_MAX_KEYS = 1_000_000
-_GGUF_MAX_ARRAY = 10_000_000
-_GGUF_MAX_STRING = 16 << 20
-_GGUF_MAX_DEPTH = 8
-_GGUF_MAX_ALIGNMENT = 1 << 20
+_GGUF_MAX_METADATA, _GGUF_MAX_TENSORS, _GGUF_MAX_KEYS, _GGUF_MAX_ARRAY = 256 << 20, 1_000_000, 1_000_000, 10_000_000
+_GGUF_MAX_STRING, _GGUF_MAX_DEPTH, _GGUF_MAX_ALIGNMENT = 16 << 20, 8, 1 << 20
 _GGUF_SCALARS = {0:'B', 1:'b', 2:'H', 3:'h', 4:'I', 5:'i', 6:'f', 7:'B', 10:'Q', 11:'q', 12:'d'}
 _GGUF_VALUE_MIN = {t:struct.calcsize(fmt) for t,fmt in _GGUF_SCALARS.items()} | {8:8, 9:12}
 
 def _gguf_identity(f: BinaryIO) -> tuple[int, int, int, int]:
-  s = os.fstat(f.fileno())
-  if not stat.S_ISREG(s.st_mode): raise ValueError('GGUF input must be a regular file')
+  if not stat.S_ISREG((s := os.fstat(f.fileno())).st_mode): raise ValueError('GGUF input must be a regular file')
   return s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns
 
 class _GGUFReader:
@@ -294,8 +278,7 @@ class _GGUFReader:
     return data
   def scalar(self, fmt: str): return struct.unpack('<'+fmt, self.read(struct.calcsize(fmt)))[0]
   def string(self, limit: int) -> str:
-    n = self.scalar('Q')
-    if n > limit: raise ValueError('GGUF string length limit exceeded')
+    if (n := self.scalar('Q')) > limit: raise ValueError('GGUF string length limit exceeded')
     return self.read(n).decode('utf-8', errors='strict')
   def value(self, typ: int, depth: int = 0):
     if typ not in _GGUF_VALUE_MIN: raise ValueError(f'Invalid GGUF metadata type {typ}')
@@ -308,65 +291,48 @@ class _GGUFReader:
       self.check(n * _GGUF_VALUE_MIN[subtype])
       return [self.value(subtype, depth+1) for _ in range(n)]
     value = self.scalar(_GGUF_SCALARS[typ])
-    if typ == 7:
-      if value not in (0, 1): raise ValueError('Invalid GGUF bool')
-      return bool(value)
-    return value
+    if typ == 7 and value not in (0, 1): raise ValueError('Invalid GGUF bool')
+    return bool(value) if typ == 7 else value
 
 def _gguf_nbytes(shape: tuple[int, ...], typ: int) -> int:
   if not 1 <= len(shape) <= 4 or any(type(d) is not int or d <= 0 for d in shape): raise ValueError('Invalid GGUF tensor shape')
-  n = prod(shape)
-  if n > sys.maxsize: raise ValueError('GGUF tensor size overflow')
-  if typ in _GGML_NATIVE: size = n * _GGML_NATIVE[typ].itemsize
-  elif typ in _GGML_QUANT:
-    elements, block_bytes = _GGML_QUANT[typ]
-    if shape[-1] % elements or n % elements: raise ValueError('GGUF quantized row is not block aligned')
-    size = n // elements * block_bytes
-  else: raise ValueError(f'Unknown GGML tensor type {typ}')
-  if size > sys.maxsize: raise ValueError('GGUF tensor byte size overflow')
+  if (n := prod(shape)) > sys.maxsize: raise ValueError('GGUF tensor size overflow')
+  if typ not in _GGML_NATIVE and typ not in _GGML_QUANT: raise ValueError(f'Unknown GGML tensor type {typ}')
+  elements, block_bytes = (1, _GGML_NATIVE[typ].itemsize) if typ in _GGML_NATIVE else _GGML_QUANT[typ]
+  if shape[-1] % elements or n % elements: raise ValueError('GGUF quantized row is not block aligned')
+  if (size := n // elements * block_bytes) > sys.maxsize: raise ValueError('GGUF tensor byte size overflow')
   return size
 
 def _index_gguf_part(path: pathlib.Path, part: int, budget: dict[str, int]) -> tuple[GGUFPart, dict, list[GGUFTensorInfo]]:
   with path.open('rb') as f:
-    identity = _gguf_identity(f)
-    r = _GGUFReader(f, identity[2], budget)
+    r = _GGUFReader(f, (identity := _gguf_identity(f))[2], budget)
     if r.read(4) != b'GGUF' or r.scalar('I') not in (2, 3): raise ValueError('Expected little-endian GGUF v2/v3')
-    nt, nk = r.scalar('Q'), r.scalar('Q')
-    r.consume('tensors', nt)
-    r.consume('keys', nk)
+    nt, nk, kv, descriptors = r.scalar('Q'), r.scalar('Q'), {}, {}
+    for kind, n in (('tensors', nt), ('keys', nk)): r.consume(kind, n)
     r.check(nt * 32 + nk * 13)  # minimum encoded descriptor/key sizes, before any count-driven iteration
-    kv = {}
     for _ in range(nk):
-      key = r.string(65535)
-      if not key or '\x00' in key or key in kv: raise ValueError('Empty, NUL or duplicate GGUF metadata key')
+      if not (key := r.string(65535)) or '\x00' in key or key in kv: raise ValueError('Empty, NUL or duplicate GGUF metadata key')
       kv[key] = r.value(r.scalar('I'))
-    alignment = kv.get('general.alignment', 32)
-    if type(alignment) is not int or not 0 < alignment <= _GGUF_MAX_ALIGNMENT or alignment % 8:
+    if type(alignment := kv.get('general.alignment', 32)) is not int or not 0 < alignment <= _GGUF_MAX_ALIGNMENT or alignment % 8:
       raise ValueError('GGUF alignment must be a positive multiple of 8, at most 1 MiB')
-    infos, names = [], set()
     for _ in range(nt):
       name, rank = r.string(64), r.scalar('I')
-      if not name or '\x00' in name or name in names: raise ValueError('Empty, NUL or duplicate GGUF tensor name')
-      names.add(name)
+      if not name or '\x00' in name or name in descriptors: raise ValueError('Empty, NUL or duplicate GGUF tensor name')
       if not 1 <= rank <= 4: raise ValueError('GGUF tensor rank must be 1..4')
-      shape = tuple(reversed([r.scalar('Q') for _ in range(rank)]))
-      typ, offset = r.scalar('I'), r.scalar('Q')
+      shape, typ, offset = tuple(reversed([r.scalar('Q') for _ in range(rank)])), r.scalar('I'), r.scalar('Q')
       if offset % alignment: raise ValueError('Unaligned GGUF tensor offset')
-      infos.append(GGUFTensorInfo(name, part, shape, typ, offset, _gguf_nbytes(shape, typ)))
-    start = (f.tell()+alignment-1)//alignment*alignment
+      descriptors[name] = GGUFTensorInfo(name, part, shape, typ, offset, _gguf_nbytes(shape, typ))
+    start = end = round_up(f.tell(), alignment)
     if start > identity[2]: raise ValueError('Truncated GGUF data alignment')
-    infos = [GGUFTensorInfo(t.name, part, t.shape, t.ggml_type, start+t.offset, t.nbytes) for t in infos]
-    end = start
+    infos = [replace(t, offset=start+t.offset) for t in descriptors.values()]
     for t in sorted(infos, key=lambda t:t.offset):
-      if t.offset < end or t.offset > sys.maxsize-t.nbytes or t.offset+t.nbytes > identity[2]:
-        raise ValueError('Overlapping or out-of-file GGUF tensor payload')
+      if t.offset < end or t.offset+t.nbytes > min(sys.maxsize, identity[2]): raise ValueError('Overlapping or out-of-file GGUF tensor payload')
       end = t.offset+t.nbytes
     if _gguf_identity(f) != identity: raise ValueError('GGUF file changed while indexing')
   return GGUFPart(path, identity[2], identity), kv, infos
 
 def _gguf_split_int(kv: dict, key: str, default: int) -> int:
-  value = kv.get(key, default)
-  if type(value) is not int or value < 0: raise ValueError(f'Invalid GGUF {key}')
+  if type(value := kv.get(key, default)) is not int or value < 0: raise ValueError(f'Invalid GGUF {key}')
   return value
 
 def index_gguf(path: str | pathlib.Path) -> GGUFIndex:
@@ -379,20 +345,17 @@ def index_gguf(path: str | pathlib.Path) -> GGUFIndex:
   path = pathlib.Path(path).absolute()
   budget = {'metadata':_GGUF_MAX_METADATA, 'tensors':_GGUF_MAX_TENSORS, 'keys':_GGUF_MAX_KEYS, 'array':_GGUF_MAX_ARRAY}
   first, kv, tensors = _index_gguf_part(path, 0, budget)
-  count = _gguf_split_int(kv, 'split.count', 1)
-  if not 1 <= count <= min(99999, _GGUF_MAX_TENSORS): raise ValueError('Invalid GGUF split count')
+  if not 1 <= (count := _gguf_split_int(kv, 'split.count', 1)) <= min(99999, _GGUF_MAX_TENSORS): raise ValueError('Invalid GGUF split count')
   if _gguf_split_int(kv, 'split.no', 0) != 0: raise ValueError('GGUF must start at split.no=0')
   match = re.fullmatch(r'(.*)-(\d{5})-of-(\d{5})\.gguf', path.name)
   if match and (int(match[2]) != 1 or int(match[3]) != count): raise ValueError('GGUF split filename/count mismatch')
   if count > 1 and (match is None or 'split.no' not in kv): raise ValueError('Missing GGUF first split filename/index')
-  parts, identities, names = [first], {first.identity[:2]}, {t.name for t in tensors}
+  parts, descriptors = {first.identity[:2]:first}, {t.name:t for t in tensors}
   totals = [_gguf_split_int(kv, 'split.tensors.count', -1)] if 'split.tensors.count' in kv else []
   for no in range(1, count):
     assert match is not None
-    pp = path.with_name(f'{match[1]}-{no+1:05d}-of-{count:05d}.gguf')
-    part, other, infos = _index_gguf_part(pp, no, budget)
-    if part.identity[:2] in identities: raise ValueError('Duplicate GGUF part identity')
-    identities.add(part.identity[:2])
+    part, other, infos = _index_gguf_part(path.with_name(f'{match[1]}-{no+1:05d}-of-{count:05d}.gguf'), no, budget)
+    if part.identity[:2] in parts: raise ValueError('Duplicate GGUF part identity')
     if _gguf_split_int(other, 'split.no', -1) != no or _gguf_split_int(other, 'split.count', -1) != count:
       raise ValueError('GGUF split index/count mismatch')
     if 'split.tensors.count' in other: totals.append(_gguf_split_int(other, 'split.tensors.count', -1))
@@ -402,12 +365,11 @@ def index_gguf(path: str | pathlib.Path) -> GGUFIndex:
         if type(value) is not type(kv[key]) or value != kv[key]: raise ValueError(f'Conflicting GGUF split metadata: {key}')
       elif key in ('general.architecture', 'general.quantization_version', 'general.tensor_data_layout') or not key.startswith('general.'):
         raise ValueError(f'Later-only GGUF configuration/tokenizer metadata: {key}')
-    if names.intersection(t.name for t in infos): raise ValueError('Duplicate GGUF tensor across parts')
-    names.update(t.name for t in infos)
-    tensors.extend(infos)
-    parts.append(part)
-  if any(total != len(tensors) for total in totals): raise ValueError('GGUF aggregate tensor count mismatch')
-  return GGUFIndex(kv, tuple(parts), tuple(tensors))
+    if descriptors.keys() & (t.name for t in infos): raise ValueError('Duplicate GGUF tensor across parts')
+    descriptors.update((t.name, t) for t in infos)
+    parts[part.identity[:2]] = part
+  if any(total != len(descriptors) for total in totals): raise ValueError('GGUF aggregate tensor count mismatch')
+  return GGUFIndex(kv, tuple(parts.values()), tuple(descriptors.values()))
 
 def load_gguf_tensor(index: GGUFIndex, info: GGUFTensorInfo, *, device: str) -> Tensor:
   """Read one exact packed payload onto an explicit owner, then decode lazily on that owner.
