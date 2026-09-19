@@ -1,5 +1,6 @@
 from __future__ import annotations
-import enum, functools, itertools, math, pathlib
+import enum, functools, itertools, math, pathlib, threading
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
@@ -501,12 +502,23 @@ def _shape_only_llama(config:TransformerConfig) -> tuple[list[FFNBlock], nn.Embe
   return blocks, embedding, norm(config.dim), linear(config.vocab_size, config.dim)
 
 
+class PlacedInferenceError(RuntimeError):
+  """Backend failure. Metadata only: never include backend messages, prompts or payloads."""
+  def __init__(self, stage:int|None, device:str, operation:str):
+    self.stage, self.device, self.operation = stage, device, operation
+    super().__init__(f'placed inference failed: stage={stage}, device={device}, operation={operation}; reload required')
+
+
+class PlacedModelUnavailableError(RuntimeError): pass
+class PlacedModelBusyError(RuntimeError): pass
+
+
 class _LayerStage:
-  __slots__ = ('device', '_forward')
+  __slots__ = ('device', '_forward', 'single_jit', 'chunk_jit', 'chunk_size')
 
   def __init__(self, device:str, blocks:list[FFNBlock], embedding:nn.Embedding|None,
-               norm:nn.RMSNorm|None, output:Linear|None):
-    self.device = device
+               norm:nn.RMSNorm|None, output:Linear|None, chunk_size:int):
+    self.device, self.chunk_size = device, chunk_size
     # No parent pointer or second registered weight tree: closures live behind the slotted executor.
     def forward(value:Tensor, start_pos:UOp) -> Tensor:
       x = embedding(value).float() if embedding is not None else value
@@ -514,17 +526,22 @@ class _LayerStage:
       if norm is not None and output is not None: x = output(norm(x[:, -1:]))[:, -1, :]
       return x.float().contiguous().realize()
     self._forward = forward
+    self.single_jit = TinyJit(forward)
+    self.chunk_jit = TinyJit(forward) if chunk_size > 1 else None
 
   def run(self, value:Tensor, start_pos:UOp, *, jit:bool=True) -> Tensor:
-    return self._forward(value, start_pos)
+    runner = self.single_jit if value.shape[1] == 1 else self.chunk_jit if value.shape[1] == self.chunk_size else None
+    return runner(value, start_pos) if jit and runner is not None else self._forward(value, start_pos)
 
 
 class _PlacedExecutor:
   # Generic get_state_dict must not traverse stage closures or CapturedJit.ret.
-  __slots__ = ('stages', 'placement', 'config')
+  __slots__ = ('stages', 'placement', 'config', 'state', 'lock', 'owner')
 
   def __init__(self, model:Transformer, config:TransformerConfig, placement:LayerPlacement):
     self.placement, self.config = placement, config
+    self.state, self.lock = 'ready', threading.Lock()
+    self.owner:object|None = None
     stages, start = [], 0
     for i,(device,count) in enumerate(zip(placement.devices, placement.layer_counts)):
       Device[device]  # device opening is forbidden inside function bodies
@@ -536,7 +553,7 @@ class _PlacedExecutor:
       Device[device].synchronize()
       last = i == len(placement.devices)-1
       stages.append(_LayerStage(device, model.blk[start:start+count], model.token_embd if i == 0 else None,
-                                model.output_norm if last else None, model.output if last else None))
+                                model.output_norm if last else None, model.output if last else None, placement.chunk_size))
       start += count
     self.stages = tuple(stages)
 
@@ -544,6 +561,11 @@ class _PlacedExecutor:
 class Transformer:
   placement: LayerPlacement  # present only for explicit placed loading
   _placed: _PlacedExecutor
+
+  def __setattr__(self, name, value):
+    if name in ('placement', 'max_context') and hasattr(self, '_placed'):
+      raise ValueError('placed configuration is immutable; reload required')
+    super().__setattr__(name, value)
 
   def __init__(self, config:TransformerConfig, *, _shape_only:bool=False):
     self.blk:list[FFNBlock]
@@ -592,6 +614,57 @@ class Transformer:
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
+  def check_available(self):
+    """Synchronous availability check, including before a caller sends streaming headers."""
+    if hasattr(self, '_placed'):
+      if self._placed.state == 'failed': raise PlacedModelUnavailableError('placed model failed; reload required')
+      if self._placed.state != 'ready': raise PlacedModelBusyError('placed model is in use')
+
+  @contextmanager
+  def _placed_transaction(self, operation:str):
+    executor = self._placed
+    if not executor.lock.acquire(blocking=False): raise PlacedModelBusyError('placed model is in use')
+    try:
+      self.check_available()
+      if self.max_context != executor.config.max_context or any(b.config is not executor.config for b in self.blk):
+        raise ValueError('placed configuration changed; reload required')
+      owner = object()
+      executor.owner, executor.state = owner, 'generating'
+      try: yield owner
+      except BaseException as exc:
+        executor.state, self._cached_tokens = 'failed', []
+        if isinstance(exc, Exception) and not isinstance(exc, PlacedInferenceError):
+          raise PlacedInferenceError(None, executor.placement.devices[-1], operation) from None
+        raise
+      finally:
+        executor.owner = None
+        if executor.state != 'failed': executor.state = 'ready'
+    finally: executor.lock.release()
+
+  @contextmanager
+  def _placed_operation(self, stage:int, operation:str):
+    try: yield
+    except Exception: raise PlacedInferenceError(stage, self._placed.placement.devices[stage], operation) from None
+
+  def _placed_sample(self, logits:Tensor, temperature:Tensor) -> Tensor:
+    with self._placed_operation(len(self._placed.stages)-1, 'sample'):
+      out = self._sample(logits, temperature).realize()
+      Device[self._placed.placement.devices[-1]].synchronize()
+      return out
+
+  def _placed_direct(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor, *, jit:bool) -> Tensor:
+    self.check_available()
+    self._placed_position(tokens, start_pos)
+    if temperature.device != self._placed.placement.devices[-1] or temperature.shape != (1,) or temperature.dtype != dtypes.float32:
+      raise ValueError('placed temperature must be FP32 [1] on the final owner')
+    with self._placed_operation(len(self._placed.stages)-1, 'input'): value = temperature.item()
+    if not math.isfinite(value) or value < 0: raise ValueError('temperature must be finite and nonnegative')
+    with self._placed_operation(0, 'input'): ids = list(tokens.flatten().data())
+    if any(not 0 <= t < self._placed.config.vocab_size for t in ids): raise ValueError('invalid placed token ID')
+    with self._placed_transaction('direct') as owner:
+      self._cached_tokens = []  # direct callers have no complete history contract, even on success
+      return self._placed_sample(self._placed_step(tokens, start_pos, jit=jit, owner=owner), temperature)
+
   def _placed_position(self, tokens:Tensor, start_pos:int|UOp) -> int:
     if tokens.dtype != dtypes.int32 or tokens.ndim != 2 or any(type(n) is not int for n in tokens.shape) or tokens.shape[0] != 1:
       raise ValueError('placed tokens must be concrete int32 [1, C]')
@@ -603,17 +676,19 @@ class Transformer:
     if tokens.shape[1] > self.placement.chunk_size: raise ValueError('placed token count exceeds fixed chunk size')
     return pos
 
-  def _placed_step(self, tokens:Tensor, start_pos:int|UOp, *, jit:bool=True) -> Tensor:
+  def _placed_step(self, tokens:Tensor, start_pos:int|UOp, *, jit:bool=True, owner:object|None=None) -> Tensor:
+    if owner is None or owner is not self._placed.owner: raise PlacedModelBusyError('placed step requires its transaction owner')
     pos = self._placed_position(tokens, start_pos)
     sp = UOp.variable('start_pos', 0, self.max_context-1).bind(pos)
-    value = tokens.contiguous().realize()
+    with self._placed_operation(0, 'input'): value = tokens.contiguous().realize()
     for i,stage in enumerate(self._placed.stages):
-      if i: value = _transfer_activation(value, stage.device, self.placement.transfer)
-      value = stage.run(value, sp, jit=jit)
+      if i:
+        with self._placed_operation(i, 'transfer'): value = _transfer_activation(value, stage.device, self._placed.placement.transfer)
+      with self._placed_operation(i, 'stage'): value = stage.run(value, sp, jit=jit)
     return value
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    if hasattr(self, 'placement'): return self._sample(self._placed_step(tokens, start_pos, jit=False), temperature).realize()
+    if hasattr(self, 'placement'): return self._placed_direct(tokens, start_pos, temperature, jit=False)
     return self._sample(self.forward_embeddings(self.token_embd(tokens).float(), start_pos), temperature)
 
   def _multimodal_decode(self, tokens:Tensor, start_pos:UOp, position_ids:Tensor, temperature:Tensor) -> Tensor:
@@ -621,7 +696,7 @@ class Transformer:
     return self._sample(self.forward_embeddings(self.token_embd(tokens).float(), start_pos, position_ids), temperature)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    if hasattr(self, 'placement'): return self._sample(self._placed_step(tokens, start_pos), temperature).realize()
+    if hasattr(self, 'placement'): return self._placed_direct(tokens, start_pos, temperature, jit=True)
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
 
   @staticmethod
@@ -738,7 +813,21 @@ class Transformer:
     return model, kv
 
   def warmup(self):
-    for _ in range(2): list(zip(range(2), self.generate([0])))
+    if hasattr(self, '_placed'):
+      with self._placed_transaction('warmup') as owner:
+        self._cached_tokens = []
+        try:
+          for count in dict.fromkeys((1, self._placed.placement.chunk_size)):
+            for i in range(3):  # first eager, then capture, then replay
+              tokens = Tensor([[i % self._placed.config.vocab_size]*count], dtype=dtypes.int32, device=self._placed.placement.devices[0])
+              self._placed_step(tokens, 0, owner=owner)
+          for stage in self._placed.stages: Device[stage.device].synchronize()
+        finally: self._cached_tokens = []
+      return
+    for _ in range(2):
+      gen = self.generate([0])
+      try: list(zip(range(2), gen))
+      finally: gen.close()
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
@@ -749,6 +838,11 @@ class Transformer:
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
   def reset_generation_state(self):
+    if hasattr(self, '_placed'):
+      with self._placed_transaction('reset'):
+        self._cached_tokens = []
+        self._generation_epoch += 1
+      return
     # Position zero resets GDN and overwrites the valid KV prefix. Never replace buffers captured by a JIT.
     self._cached_tokens = []
     self._generation_epoch += 1
@@ -815,19 +909,24 @@ class Transformer:
     try: valid_temperature = type(temperature) in (int, float) and math.isfinite(temperature) and temperature >= 0
     except OverflowError: valid_temperature = False
     if not valid_temperature: raise ValueError('temperature must be finite and nonnegative')
-    temp = Tensor([temperature], dtype=dtypes.float32, device=self.placement.devices[-1]).realize()
-    pos = self.get_start_pos(tokens)
-    while len(tokens) < self.max_context:
-      end = min(pos+chunk_size, len(tokens))
-      value = Tensor([tokens[pos:end]], dtype=dtypes.int32, device=self.placement.devices[0]).realize()
-      logits = self._placed_step(value, pos)
-      pos = end
-      if pos < len(tokens): continue
-      out = self._sample(logits, temp).realize()
-      Device[self.placement.devices[-1]].synchronize()
-      tokens.append(int(out.item()))
-      self._cached_tokens = tokens[:-1]
-      yield tokens[-1]
+    with self._placed_transaction('generation') as owner:
+      temp = Tensor([temperature], dtype=dtypes.float32, device=self._placed.placement.devices[-1]).realize()
+      pos = self.get_start_pos(tokens)
+      # Own the working history, so a caller mutating its list between yields cannot corrupt prefix metadata.
+      history = tokens.copy()
+      while len(history) < self.max_context:
+        end = min(pos+chunk_size, len(history))
+        value = Tensor([history[pos:end]], dtype=dtypes.int32, device=self._placed.placement.devices[0]).realize()
+        logits = self._placed_step(value, pos, owner=owner)
+        pos = end
+        if pos < len(history): continue
+        with self._placed_operation(len(self._placed.stages)-1, 'sample'):
+          token = int(self._placed_sample(logits, temp).item())
+        history.append(token)
+        tokens.append(token)  # retain the legacy list-append surface
+        self._cached_tokens = history[:-1]
+        try: yield token
+        except GeneratorExit: return  # only this clean, fully committed token boundary can release as ready
 
   def generate(self, tokens:list[int], chunk_size:int|None=None, temperature:float=0.0, *,
                inputs_embeds:Tensor|None=None, position_ids:Tensor|None=None, rope_delta:int=0):
