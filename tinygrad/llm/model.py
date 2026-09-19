@@ -6,6 +6,28 @@ from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attentio
 from tinygrad.llm.gguf import gguf_load, GGUFIndex, index_gguf, load_gguf_tensor
 from tinygrad.llm.placement import LayerPlacement, _placement_manifest
 from tinygrad.uop.ops import resolve
+from tinygrad.device import Device
+
+
+def _transfer_activation(x:Tensor, destination:str, mode:str) -> Tensor:
+  """Serialized concrete FP32/int32 transport, outside capture. Native is not a P2P guarantee."""
+  if x.dtype not in (dtypes.float32, dtypes.int32) or any(type(n) is not int for n in x.shape) or not isinstance(x.device, str):
+    raise ValueError('placed transport requires concrete FP32 or int32 storage on one device')
+  if mode not in ('host', 'native'): raise ValueError('unknown placed transfer mode')
+  destination, source_device = Device.canonicalize(destination), x.device
+  x = x.contiguous().realize()
+  if source_device == destination: return x
+  if mode == 'native':
+    out = x.to(destination).realize()
+    Device[source_device].synchronize()
+    Device[destination].synchronize()
+    return out
+  Device[source_device].synchronize()
+  # bytes owns the copyout; source owns _frompy's separate buffer until the destination is finished.
+  source = Tensor(bytes(x.data()), dtype=dtypes.uint8, device='PYTHON').realize()
+  out = source.to(destination).realize()
+  Device[destination].synchronize()
+  return out.bitcast(x.dtype).reshape(x.shape)
 
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
@@ -479,8 +501,49 @@ def _shape_only_llama(config:TransformerConfig) -> tuple[list[FFNBlock], nn.Embe
   return blocks, embedding, norm(config.dim), linear(config.vocab_size, config.dim)
 
 
+class _LayerStage:
+  __slots__ = ('device', '_forward')
+
+  def __init__(self, device:str, blocks:list[FFNBlock], embedding:nn.Embedding|None,
+               norm:nn.RMSNorm|None, output:Linear|None):
+    self.device = device
+    # No parent pointer or second registered weight tree: closures live behind the slotted executor.
+    def forward(value:Tensor, start_pos:UOp) -> Tensor:
+      x = embedding(value).float() if embedding is not None else value
+      for block in blocks: x = block(x, start_pos)
+      if norm is not None and output is not None: x = output(norm(x[:, -1:]))[:, -1, :]
+      return x.float().contiguous().realize()
+    self._forward = forward
+
+  def run(self, value:Tensor, start_pos:UOp, *, jit:bool=True) -> Tensor:
+    return self._forward(value, start_pos)
+
+
+class _PlacedExecutor:
+  # Generic get_state_dict must not traverse stage closures or CapturedJit.ret.
+  __slots__ = ('stages', 'placement', 'config')
+
+  def __init__(self, model:Transformer, config:TransformerConfig, placement:LayerPlacement):
+    self.placement, self.config = placement, config
+    stages, start = [], 0
+    for i,(device,count) in enumerate(zip(placement.devices, placement.layer_counts)):
+      Device[device]  # device opening is forbidden inside function bodies
+      for block in model.blk[start:start+count]:
+        assert isinstance(block, TransformerBlock)
+        block.cache_kv = Tensor.zeros(2, 1, config.n_kv_heads, config.max_context, config.head_dim,
+                                      dtype=dtypes.half, device=device).contiguous().realize()
+        block.freqs_cis = precompute_freqs_cis(config.rope_dim, config.max_context, config.rope_theta, device).float().contiguous().realize()
+      Device[device].synchronize()
+      last = i == len(placement.devices)-1
+      stages.append(_LayerStage(device, model.blk[start:start+count], model.token_embd if i == 0 else None,
+                                model.output_norm if last else None, model.output if last else None))
+      start += count
+    self.stages = tuple(stages)
+
+
 class Transformer:
   placement: LayerPlacement  # present only for explicit placed loading
+  _placed: _PlacedExecutor
 
   def __init__(self, config:TransformerConfig, *, _shape_only:bool=False):
     self.blk:list[FFNBlock]
@@ -508,6 +571,7 @@ class Transformer:
     self._multimodal_active = False
 
   def forward_embeddings(self, x:Tensor, start_pos:int|UOp, position_ids:Tensor|None=None) -> Tensor:
+    if hasattr(self, 'placement'): raise ValueError('placement does not support public embeddings')
     if position_ids is not None:
       if x.ndim != 3 or x.shape[0] != 1 or x.shape[2] != self.token_embd.weight.shape[1] or x.dtype != dtypes.float32:
         raise ValueError("multimodal embeddings must be float32 [1, L, decoder_dim]")
@@ -528,13 +592,36 @@ class Transformer:
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
+  def _placed_position(self, tokens:Tensor, start_pos:int|UOp) -> int:
+    if tokens.dtype != dtypes.int32 or tokens.ndim != 2 or any(type(n) is not int for n in tokens.shape) or tokens.shape[0] != 1:
+      raise ValueError('placed tokens must be concrete int32 [1, C]')
+    if tokens.device != self.placement.devices[0]: raise ValueError('placed tokens must be on the first owner')
+    try: pos = start_pos.unbind()[1] if isinstance(start_pos, UOp) else start_pos
+    except (AssertionError, ValueError): raise ValueError('placed start_pos must be an integer or bound variable') from None
+    if type(pos) is not int or not 0 <= pos < pos+tokens.shape[1] <= self.max_context:
+      raise ValueError('placed token positions must fit the context')
+    if tokens.shape[1] > self.placement.chunk_size: raise ValueError('placed token count exceeds fixed chunk size')
+    return pos
+
+  def _placed_step(self, tokens:Tensor, start_pos:int|UOp, *, jit:bool=True) -> Tensor:
+    pos = self._placed_position(tokens, start_pos)
+    sp = UOp.variable('start_pos', 0, self.max_context-1).bind(pos)
+    value = tokens.contiguous().realize()
+    for i,stage in enumerate(self._placed.stages):
+      if i: value = _transfer_activation(value, stage.device, self.placement.transfer)
+      value = stage.run(value, sp, jit=jit)
+    return value
+
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+    if hasattr(self, 'placement'): return self._sample(self._placed_step(tokens, start_pos, jit=False), temperature).realize()
     return self._sample(self.forward_embeddings(self.token_embd(tokens).float(), start_pos), temperature)
 
   def _multimodal_decode(self, tokens:Tensor, start_pos:UOp, position_ids:Tensor, temperature:Tensor) -> Tensor:
+    if hasattr(self, 'placement'): raise ValueError('placement does not support multimodal decode')
     return self._sample(self.forward_embeddings(self.token_embd(tokens).float(), start_pos, position_ids), temperature)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+    if hasattr(self, 'placement'): return self._sample(self._placed_step(tokens, start_pos), temperature).realize()
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
 
   @staticmethod
@@ -566,6 +653,7 @@ class Transformer:
           loaded[key] = weight
         if loaded[key].device != owner: raise ValueError(f'placed tensor is not on its owner: {name}')
         parameters[name].replace(loaded[key])
+      model._placed = _PlacedExecutor(model, config, placement)
       return model, index.kv
 
     # TODO: remove the need for copy to default device
@@ -719,8 +807,35 @@ class Transformer:
       # A retained old iterator must not reset a newer request's live state when it is eventually closed.
       if epoch == self._generation_epoch: self.reset_generation_state()
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, *,
+  def _generate_placed(self, tokens:list[int], chunk_size:int, temperature:float):
+    if type(chunk_size) is not int or chunk_size != self.placement.chunk_size:
+      raise ValueError('placed chunk_size is fixed at load time')
+    if not isinstance(tokens, list) or not 0 < len(tokens) <= self.max_context or any(
+        type(t) is not int or not 0 <= t < self._placed.config.vocab_size for t in tokens): raise ValueError('invalid placed prompt tokens')
+    try: valid_temperature = type(temperature) in (int, float) and math.isfinite(temperature) and temperature >= 0
+    except OverflowError: valid_temperature = False
+    if not valid_temperature: raise ValueError('temperature must be finite and nonnegative')
+    temp = Tensor([temperature], dtype=dtypes.float32, device=self.placement.devices[-1]).realize()
+    pos = self.get_start_pos(tokens)
+    while len(tokens) < self.max_context:
+      end = min(pos+chunk_size, len(tokens))
+      value = Tensor([tokens[pos:end]], dtype=dtypes.int32, device=self.placement.devices[0]).realize()
+      logits = self._placed_step(value, pos)
+      pos = end
+      if pos < len(tokens): continue
+      out = self._sample(logits, temp).realize()
+      Device[self.placement.devices[-1]].synchronize()
+      tokens.append(int(out.item()))
+      self._cached_tokens = tokens[:-1]
+      yield tokens[-1]
+
+  def generate(self, tokens:list[int], chunk_size:int|None=None, temperature:float=0.0, *,
                inputs_embeds:Tensor|None=None, position_ids:Tensor|None=None, rope_delta:int=0):
+    if hasattr(self, 'placement'):
+      if inputs_embeds is not None or position_ids is not None or rope_delta != 0: raise ValueError('placement does not support multimodal inputs')
+      yield from self._generate_placed(tokens, self.placement.chunk_size if chunk_size is None else chunk_size, temperature)
+      return
+    if chunk_size is None: chunk_size = 32
     if inputs_embeds is not None or position_ids is not None or rope_delta != 0:
       yield from self._generate_multimodal(tokens, chunk_size, temperature, inputs_embeds, position_ids, rope_delta)
       return

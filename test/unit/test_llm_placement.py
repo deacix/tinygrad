@@ -295,8 +295,10 @@ class TestPlacedLoading:
          patch.object(Tensor,'_next_counter',side_effect=AssertionError('RNG state')), \
          patch('tinygrad.nn.state.load_state_dict',side_effect=AssertionError('moving state loader')):
       model, kv = Transformer.from_gguf(path,realize=False,placement=placement)
-    params = nn.state.get_state_dict(model)
+    state = nn.state.get_state_dict(model)
+    params = {name:t for name,t in state.items() if name.endswith('.weight')}
     assert set(params) == set(infos) and kv['general.name'] == 'offline fixture'
+    assert set(state) - set(params) == {f'blk.{i}.{name}' for i in range(4) for name in ('cache_kv','freqs_cis')}
     expected = {(info.part,info.offset,info.nbytes,placement.owner(name)) for name,info in infos.items()}
     assert len(calls) == len(expected) and set(calls) == expected
     assert copies == [(size,device) for _,_,size,device in calls]
@@ -312,7 +314,8 @@ class TestPlacedLoading:
     if tied and len(devices) == 1: assert model.output.weight.uop is model.token_embd.weight.uop
     else: assert buffer_roots(model.output.weight).isdisjoint(buffer_roots(model.token_embd.weight))
     assert model.placement == placement
-    assert all(not hasattr(b,'cache_kv') and not hasattr(b,'freqs_cis') for b in model.blk)  # B1 is loading only
+    assert all(b.cache_kv.device == b.freqs_cis.device == placement.block_device(i) for i,b in enumerate(model.blk))
+    assert all(b.cache_kv.uop.is_realized and b.freqs_cis.uop.is_realized for b in model.blk)
     assert model.output.__dict__['use_custom_quant'] is False
     for b in model.blk:
       for value in vars(b).values():
