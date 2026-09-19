@@ -11,10 +11,14 @@ against Transformers commit 049d2bf1220747b6d39e2a978b9f5fe0defa1dca.
 Generation is offline: small pinned tokenizer/processor metadata is bundled in
 the archive. For bootstrap only, --metadata-dir accepts those two official JSON
 files. --verify needs only NumPy; regeneration needs the reference environment.
-Only A1 is implemented: no --phase flag, native casts, quantized or e2e claims.
+  python test/external/external_qwen_vl.py --phase text --synthetic
+
+Text phase uses tinygrad and the offline cast-tier fixtures (no reference install).
+A1/A2 only: no image fusion, full checkpoint, quantized or hardware acceptance claims.
 """
 import argparse, hashlib, importlib.metadata, io, json, platform, tempfile, zipfile, zlib
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 import numpy as np
 
@@ -40,10 +44,10 @@ METADATA_HASHES = {"preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962
 PROCESSOR = {"size": {"shortest_edge": 65536, "longest_edge": 262144}, "patch_size": 16, "temporal_patch_size": 2,
              "merge_size": 2, "image_mean": [0.5]*3, "image_std": [0.5]*3, "do_resize": True, "resample": 3,
              "do_rescale": True, "rescale_factor": 1/255, "do_normalize": True, "do_convert_rgb": True}
-VISION = {"depth": 2, "hidden_size": 16, "intermediate_size": 24, "num_heads": 2, "in_channels": 3,
+VISION:dict[str, Any] = {"depth": 2, "hidden_size": 16, "intermediate_size": 24, "num_heads": 2, "in_channels": 3,
           "patch_size": 16, "temporal_patch_size": 2, "spatial_merge_size": 2, "out_hidden_size": 24,
           "num_position_embeddings": 25, "hidden_act": "gelu_pytorch_tanh", "initializer_range": 0.02}
-TEXT = {"vocab_size": 64, "hidden_size": 24, "intermediate_size": 40, "num_hidden_layers": 2, "num_attention_heads": 4,
+TEXT:dict[str, Any] = {"vocab_size": 64, "hidden_size": 24, "intermediate_size": 40, "num_hidden_layers": 2, "num_attention_heads": 4,
         "num_key_value_heads": 2, "head_dim": 16, "linear_num_key_heads": 2, "linear_num_value_heads": 6,
         "linear_key_head_dim": 4, "linear_value_head_dim": 6, "linear_conv_kernel_dim": 4,
         "layer_types": ["linear_attention", "full_attention"], "max_position_embeddings": 2048, "rms_norm_eps": 1e-6,
@@ -51,7 +55,7 @@ TEXT = {"vocab_size": 64, "hidden_size": 24, "intermediate_size": 40, "num_hidde
         "initializer_range": 0.02, "use_cache": True,
         "rope_parameters": {"rope_type": "default", "rope_theta": 10000000.0, "partial_rotary_factor": 0.5,
                             "mrope_section": [2, 1, 1], "mrope_interleaved": True}}
-TOLERANCE = {"rtol": 1e-4, "atol": 1e-5}
+TOLERANCE:dict[str, Any] = {"rtol": 1e-4, "atol": 1e-5}
 
 def digest(data): return hashlib.sha256(data).hexdigest()
 
@@ -228,7 +232,7 @@ def text_fixtures(torch, hf, arrays):
   put(arrays, "text.embeddings.logits", model(inputs_embeds=model.model.embed_tokens(ids), use_cache=False).logits)
   for mode, lengths in (("tokenwise", [1]*10), ("chunked", [3, 2, 5]), ("prefill_decode", [6, 1, 1, 1, 1])):
     cache, start, logits, conv, recurrent = None, 0, [], [], []
-    blocks = [[] for _ in model.model.layers]
+    blocks:list[list[Any]] = [[] for _ in model.model.layers]
     def collect(index):
       def hook(_module, _args, output): blocks[index].append(output.detach().clone())
       return hook
@@ -253,6 +257,71 @@ def text_fixtures(torch, hf, arrays):
   put(arrays, "gdn.low_norm.input", low_norm)
   put(arrays, "gdn.low_norm.output", hf.l2norm(low_norm, dim=-1, eps=1e-6))
   return model
+
+def native_cast_text_fixtures(torch, hf, arrays, *, round_input=True, prefix="text.native_cast"):
+  """Official HF algebra with ONLY native cast boundaries, separately named from the immutable FP32 oracle.
+
+  Synthetic weights remain FP32. GDN rounds its normalized input and the gated RMSNorm output to FP16;
+  all projections promote those rounded operands to FP32 with FP32 weights. Conv/recurrent state stays FP32.
+  Full attention stores post-RoPE K and V in FP16, promoting reads for FP32 query/attention arithmetic.
+  No head/layout/algebra patches: official grouped heads, epsilon, SiLU/sigmoid and cache updates are unchanged.
+  round_input=False captures the existing codegen/late/coalesce.py pm_simplify_add_image rewrite removing a
+  fused float->half->float roundtrip with FP32 projection weights. It does NOT remove materialized FP16 outputs.
+  Keep BOTH variants; do not silently pass this backend/compiler distinction off as HF FP32 or nominal FP16.
+  """
+  from transformers.cache_utils import Cache
+  model = hf.Qwen3_5ForCausalLM(hf.Qwen3_5TextConfig(**TEXT, attn_implementation="eager")).eval()
+  model.load_state_dict({name.removeprefix("text.weights."): torch.from_numpy(value)
+                         for name, value in arrays.items() if name.startswith("text.weights.")}, strict=True)
+  gdn = model.model.layers[0].linear_attn
+  assert gdn.chunk_gated_delta_rule is hf.torch_chunk_gated_delta_rule
+  assert gdn.recurrent_gated_delta_rule is hf.torch_recurrent_gated_delta_rule
+  assert gdn.causal_conv1d_fn is None and gdn.causal_conv1d_update is hf.torch_causal_conv1d_update
+  assert isinstance(gdn.norm, hf.Qwen3_5RMSNormGated) and model.config._attn_implementation == "eager"
+  def round_hidden(_module, inputs, kwargs):
+    return inputs, kwargs | {"hidden_states": kwargs["hidden_states"].half().float()}
+  def round_output(_module, inputs): return (inputs[0].half().float(), *inputs[1:])
+  handles = [gdn.out_proj.register_forward_pre_hook(round_output)]
+  if round_input: handles.append(gdn.register_forward_pre_hook(round_hidden, with_kwargs=True))
+  original_update = Cache.update
+  def update(cache, key, value, *args, **kwargs):
+    k, v = original_update(cache, key.half(), value.half(), *args, **kwargs)
+    return k.float(), v.float()
+  ids = torch.from_numpy(arrays["text.input_ids"])
+  def save_cache(prefix, cache):
+    for name, value in (("conv_state", cache.layers[0].conv_states), ("recurrent_state", cache.layers[0].recurrent_states),
+                        ("keys", cache.layers[1].keys), ("values", cache.layers[1].values)):
+      put(arrays, prefix + name, value)
+  comparisons = {}
+  with patch.object(Cache, "update", update):
+    for mode, lengths in (("full", [10]), ("tokenwise", [1]*10), ("chunked", [3, 2, 5]), ("prefill_decode", [6, 1, 1, 1, 1])):
+      blocks:list[list[Any]] = [[] for _ in model.model.layers]
+      def collect(index):
+        def hook(_module, _args, output): blocks[index].append(output.detach().clone())
+        return hook
+      hooks = [layer.register_forward_hook(collect(i)) for i, layer in enumerate(model.model.layers)]
+      cache, start, logits = None, 0, []
+      for step, length in enumerate(lengths):
+        out = model(ids[:, start:start+length], past_key_values=cache, use_cache=True)
+        cache, start = out.past_key_values, start+length
+        logits.append(out.logits)
+        if mode == "tokenwise": save_cache(f"{prefix}.tokenwise.step.{step}.", cache)
+      for hook in hooks: hook.remove()
+      components = {"logits": torch.cat(logits, dim=1), **{f"block.{i}": torch.cat(b, dim=1) for i, b in enumerate(blocks)}}
+      if mode == "full":
+        for name, value in components.items(): put(arrays, prefix + ".full." + name, value)
+        save_cache(prefix + ".full.", cache)
+      else:
+        for name, value in components.items():
+          actual, expected = value.numpy(), arrays[prefix + ".full." + name]
+          np.testing.assert_allclose(actual, expected, **TOLERANCE)
+          comparisons[f"{mode}_{name}_vs_full"] = error_metrics(actual, expected)
+    embeddings = model(inputs_embeds=torch.from_numpy(arrays["text.inputs_embeds"]), use_cache=True).logits.numpy()
+    np.testing.assert_allclose(embeddings, arrays[prefix + ".full.logits"], **TOLERANCE)
+    comparisons["embeddings_logits_vs_full"] = error_metrics(embeddings, arrays[prefix + ".full.logits"])
+  for handle in handles: handle.remove()
+  return comparisons
+
 
 def coordinate_fixtures(torch, hf, arrays):
   config = hf.Qwen3_5Config(text_config=TEXT, vision_config=VISION)
@@ -314,7 +383,7 @@ def error_metrics(actual, expected):
 
 def generate(output, metadata_dir=None, archive_dir=ROOT):
   torch, hf = reference_imports()
-  arrays = {}
+  arrays:dict[str, np.ndarray] = {}
   meta = metadata(arrays, metadata_dir, archive_dir)
   processor, cases = processor_fixtures(arrays, meta)
   template = template_fixtures(arrays, meta)
@@ -322,6 +391,8 @@ def generate(output, metadata_dir=None, archive_dir=ROOT):
     vision_fixtures(torch, hf, arrays, processor)
     text_fixtures(torch, hf, arrays)
     coordinate_cases = coordinate_fixtures(torch, hf, arrays)
+    native_comparisons = native_cast_text_fixtures(torch, hf, arrays)
+    lowered_comparisons = native_cast_text_fixtures(torch, hf, arrays, round_input=False, prefix="text.native_lowered")
   # No pickle/object arrays; normalize byte order and C layout before hashing or serialization.
   arrays = {name: np.ascontiguousarray(a, dtype=a.dtype.newbyteorder("<")) for name, a in arrays.items()}
   comparisons = {"vision_packed_vs_separate": error_metrics(arrays["vision.merger"], arrays["vision.separate_merger"])}
@@ -375,8 +446,20 @@ def generate(output, metadata_dir=None, archive_dir=ROOT):
       "hf_fp32_algebra": {"status": "captured", "tolerance": TOLERANCE, "processor_tolerance": {"rtol": 0, "atol": 1e-7},
                           "integer_tolerance": "exact", "self_variation": comparisons,
                           "scope": "Official HF eager+Torch fallback FP32; tolerances predeclared, not fitted to native errors"},
-      "native_cast": {"status": "deferred_A2", "tolerance": {"rtol": 0.02, "atol": 0.02},
-                      "scope": "Proposed only: explicit tinygrad FP16 GDN and KV/cache cast oracle not captured here"},
+      "native_cast": {"status": "captured", "tolerance": TOLERANCE, "self_variation": native_comparisons,
+                      "scope": "Official HF eager/F32 weights with explicit FP16-roundtrip GDN input and gated norm output; "
+                               "FP16 post-RoPE K/V cache, FP32 reads/arithmetic/conv/recurrent state. No algebra/layout patches. "
+                               "text.native_cast.* only; the original text.* HF algebra arrays remain unchanged.",
+                      "algebra_drift": {name: error_metrics(arrays[f"text.native_cast.full.{name}"], arrays[f"text.full.{name}"])
+                                        for name in ("logits", "block.0", "block.1", "conv_state", "recurrent_state", "keys", "values")},
+                      "lowered_fp32_weights": {
+                        "prefix": "text.native_lowered", "tolerance": TOLERANCE, "self_variation": lowered_comparisons,
+                        "scope": "Existing codegen/late/coalesce.py pm_simplify_add_image removes fused float->half->float "
+                                 "roundtrips: FP32-weight GDN input stays FP32. Materialized GDN output and KV remain FP16. "
+                                 "Separate HF cast-only oracle; compiler behavior is explicitly probed in native tests. "
+                                 "Not quantized, BF16, FP16-weight or hardware acceptance.",
+                        "algebra_drift": {name: error_metrics(arrays[f"text.native_lowered.full.{name}"], arrays[f"text.full.{name}"])
+                                          for name in ("logits", "block.0", "block.1", "conv_state", "recurrent_state", "keys", "values")}}},
       "amd_quantized": {"status": "deferred_E", "tolerance": None,
                         "scope": "Hardware/quantization-specific acceptance must be declared before AMD evaluation"}},
     "archive": {"file": "reference.npz", "sha256": digest(raw), "bytes": len(raw),
@@ -414,11 +497,25 @@ def main():
   mode.add_argument("--generate", action="store_true")
   mode.add_argument("--verify", action="store_true")
   mode.add_argument("--check-reproducible", action="store_true")
+  mode.add_argument("--phase", choices=("text",))
+  parser.add_argument("--synthetic", action="store_true", help="Required for the native text phase; no checkpoint execution")
   parser.add_argument("--output-dir", type=Path, default=ROOT)
   parser.add_argument("--metadata-dir", type=Path, help="Bootstrap only: directory containing the two pinned metadata JSON files")
   args = parser.parse_args()
   if args.metadata_dir is not None and not args.generate: parser.error("--metadata-dir requires --generate")
-  if args.generate: generate(args.output_dir, args.metadata_dir)
+  if bool(args.phase) != args.synthetic: parser.error("--phase text requires --synthetic (and vice versa)")
+  if args.phase:
+    verify(args.output_dir)
+    from tinygrad import Device
+    from test.unit.test_llm_multimodal import compare_native_text
+    manifest = json.loads((args.output_dir / "manifest.json").read_text())
+    with np.load(args.output_dir / "reference.npz", allow_pickle=False) as src: arrays = {k: src[k] for k in src.files}
+    metrics = compare_native_text(manifest, arrays)
+    tier = manifest["parity_tiers"]["native_cast"]["lowered_fp32_weights"]
+    print(json.dumps({"phase": "text", "synthetic": True, "device": Device.DEFAULT, "tier": "native_cast.lowered_fp32_weights",
+                      "scope": tier["scope"], "tolerance": tier["tolerance"], "relative_denominator_floor": 1e-12,
+                      "metrics": metrics}, indent=2))
+  elif args.generate: generate(args.output_dir, args.metadata_dir)
   else:
     verify(args.output_dir)
     if args.check_reproducible:

@@ -1,9 +1,9 @@
 {
   "archive": {
-    "bytes": 1793016,
+    "bytes": 1871298,
     "file": "reference.npz",
     "format": "sorted little-endian C-contiguous NPY v1.0, ZIP deflate9, epoch1980, Unix0600, no extra/comment",
-    "sha256": "ed03a7685b6f3842d8ea128dc52dd89ad1e605750daed7f2783aba655985e32a"
+    "sha256": "90d713e72d6592edd26f4b0e3f1ba21ca40c77b275f2973f6e401e68f2f4d097"
   },
   "arrays": {
     "coordinates.mrope.cos": {
@@ -911,6 +911,918 @@
         1,
         10,
         24
+      ]
+    },
+    "text.native_cast.full.block.0": {
+      "dtype": "<f4",
+      "sha256": "c57fb33eb211fa6a5bdd4a7bbd8c3ed085ef965a1c31cbe26801c4ab0df22647",
+      "shape": [
+        1,
+        10,
+        24
+      ]
+    },
+    "text.native_cast.full.block.1": {
+      "dtype": "<f4",
+      "sha256": "906e57d413f7dd2f8cda518a7a5a5ed1f09027fb38bf19b0fe6fe931a7969b29",
+      "shape": [
+        1,
+        10,
+        24
+      ]
+    },
+    "text.native_cast.full.conv_state": {
+      "dtype": "<f4",
+      "sha256": "e75755eb7a3e16941f44c735ce550a9a26b5a6fea74deab5f89ff8167fe00311",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_cast.full.keys": {
+      "dtype": "<f2",
+      "sha256": "a14303f3e8b59760ecbb461868be6a81da121701c2cbed5172c79407631f50da",
+      "shape": [
+        1,
+        2,
+        10,
+        16
+      ]
+    },
+    "text.native_cast.full.logits": {
+      "dtype": "<f4",
+      "sha256": "2920306c6e819f2432d7fdf65ee2a8fe2449a565fd58f5c8b033f749e208ea65",
+      "shape": [
+        1,
+        10,
+        64
+      ]
+    },
+    "text.native_cast.full.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "f0ae81d7a42d7bccb0cd6d5b61ee103d7f4c3cd79f24a63841bf1ede20613b01",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_cast.full.values": {
+      "dtype": "<f2",
+      "sha256": "980e8b96aceb79e4e30a31658984a0179e6790876372a4bb1049e1b8dadbc442",
+      "shape": [
+        1,
+        2,
+        10,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.0.conv_state": {
+      "dtype": "<f4",
+      "sha256": "94158bb1444604a5bc79fff714a9767c58ef2cc8068fb5b3a512672726495117",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_cast.tokenwise.step.0.keys": {
+      "dtype": "<f2",
+      "sha256": "1243a34771c6b2ab6ac02bf6563f199213daba27628faa1535d015a253686347",
+      "shape": [
+        1,
+        2,
+        1,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.0.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "29dd0519149c51019487e6324922cb3817e08bf31f4c77104955a14b854f95bd",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_cast.tokenwise.step.0.values": {
+      "dtype": "<f2",
+      "sha256": "47eda188cd9cf4372cc20bc5fd24f6291635b09a39cd9cc226711a846cf14900",
+      "shape": [
+        1,
+        2,
+        1,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.1.conv_state": {
+      "dtype": "<f4",
+      "sha256": "8128e3c3089c1772f73e2d05d6a3f7669efc1bfc67b4f35676c61b98b48a2702",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_cast.tokenwise.step.1.keys": {
+      "dtype": "<f2",
+      "sha256": "82617b2b4494dfe5e108fc16ae7eed7b6145c5dde05b4483babf61b1a7bd3c90",
+      "shape": [
+        1,
+        2,
+        2,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.1.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "9ed23dd15a9c0ef4911ddc9dee9400ffe566a0573ce42cf40ca57ec27ce93fef",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_cast.tokenwise.step.1.values": {
+      "dtype": "<f2",
+      "sha256": "d707555f48f5abb606b24ed4ce522bad14bfbabd9edb6792f19d5b659ff0d1b1",
+      "shape": [
+        1,
+        2,
+        2,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.2.conv_state": {
+      "dtype": "<f4",
+      "sha256": "56e2845ede5062da607bf7e8762e44287256641cbaaf1863d9b5028112346ada",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_cast.tokenwise.step.2.keys": {
+      "dtype": "<f2",
+      "sha256": "44357e7ba1c606ed466dfcf042ad280c6af7f5dee5d132028fbc4093741d1c50",
+      "shape": [
+        1,
+        2,
+        3,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.2.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "ca2df1bafc1f395bd525e2d43053982dc20847bf0fcdad9d713e64b82f031036",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_cast.tokenwise.step.2.values": {
+      "dtype": "<f2",
+      "sha256": "b8e3f3906592447f80db9059df6d74cfc0cb83600bb6c2555a1ced7e7837bb41",
+      "shape": [
+        1,
+        2,
+        3,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.3.conv_state": {
+      "dtype": "<f4",
+      "sha256": "a9f6d65441db0ec0241c8bef5b8310900a7e79c30b3f29026b76c83c230f990a",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_cast.tokenwise.step.3.keys": {
+      "dtype": "<f2",
+      "sha256": "f69f81e3e14c20e7754f119d0f24a123ba3e7a7568b8b4b1e63bae33d0e99ce4",
+      "shape": [
+        1,
+        2,
+        4,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.3.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "0b33ca379b475bb777b1423b337ab1c940af4bc42002dacda4dcbece838435aa",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_cast.tokenwise.step.3.values": {
+      "dtype": "<f2",
+      "sha256": "95c5af8bbd08e27a5b801e659a6edbbd045f06b01b7e42ddd468feaee62423ab",
+      "shape": [
+        1,
+        2,
+        4,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.4.conv_state": {
+      "dtype": "<f4",
+      "sha256": "9914aa38478e431502c8c9e2f2292d7bff896377e30e4bb87f9a55403afbd26d",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_cast.tokenwise.step.4.keys": {
+      "dtype": "<f2",
+      "sha256": "a348c30a34b3ee2a9d667d3607674cf1062532bb6f86b84e3dc51d22da253a5f",
+      "shape": [
+        1,
+        2,
+        5,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.4.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "9120c999c6be41616691f61d373891a2d9e873e16e77fe8b131de51b73756d72",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_cast.tokenwise.step.4.values": {
+      "dtype": "<f2",
+      "sha256": "83245dd87320a13760d9a8fb98f4feb3b7c23d4e51011b886954414160fdff44",
+      "shape": [
+        1,
+        2,
+        5,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.5.conv_state": {
+      "dtype": "<f4",
+      "sha256": "c1affbfbb35489ae562f708c20440a6124c2b7689ce28a77b63c8e3f5b062ff0",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_cast.tokenwise.step.5.keys": {
+      "dtype": "<f2",
+      "sha256": "52e9b8185a59178525e66cda0874ef36a625a52f8be886f99c6145109c796a54",
+      "shape": [
+        1,
+        2,
+        6,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.5.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "59b1171258a36d1d4789c22c326c5be720a282bcdb6d24fa42e311fffadafea1",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_cast.tokenwise.step.5.values": {
+      "dtype": "<f2",
+      "sha256": "85d1b91bb47b492fdf4afafe24137d20599205245c63d9e5e92de895f9414547",
+      "shape": [
+        1,
+        2,
+        6,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.6.conv_state": {
+      "dtype": "<f4",
+      "sha256": "60d18e0e1cb7c42f0d597c9b92f641b6e2f2c5d09d16c2a811deb70665d28e86",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_cast.tokenwise.step.6.keys": {
+      "dtype": "<f2",
+      "sha256": "89a0e9489dff85723a338797f225296d5c9bae62f388210ab11d98a3fb84591f",
+      "shape": [
+        1,
+        2,
+        7,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.6.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "698570e45b20d9e86369ad490d1be75d2a81c954eaff8839d38fae0c91e1e7e8",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_cast.tokenwise.step.6.values": {
+      "dtype": "<f2",
+      "sha256": "78fa474110bec7b1a5525d38b915f505c5167c703680b65d03043e2d5af6f708",
+      "shape": [
+        1,
+        2,
+        7,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.7.conv_state": {
+      "dtype": "<f4",
+      "sha256": "e1bcb7c6b8f65b5680b1bce0a9c343480c255a138478593d00e5121249688e65",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_cast.tokenwise.step.7.keys": {
+      "dtype": "<f2",
+      "sha256": "735b905581b11ae49f413ebf933240a8d616d209ae8b75713c90174fde0f67d7",
+      "shape": [
+        1,
+        2,
+        8,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.7.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "db17a0b9ef78d004e1d7b0045516fcaa0e6a811348c0bdc73ea94542b8271cd6",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_cast.tokenwise.step.7.values": {
+      "dtype": "<f2",
+      "sha256": "aaaeb3f287e5f87d188eba1e2c55b0ff535ce3b8ce8841f07b8215541c3aff38",
+      "shape": [
+        1,
+        2,
+        8,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.8.conv_state": {
+      "dtype": "<f4",
+      "sha256": "2b22e42b0866978ffe2b6d5e69b4369b074d6538a382c2e1c690ce56bd16f1e1",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_cast.tokenwise.step.8.keys": {
+      "dtype": "<f2",
+      "sha256": "dc87a627762e5a9f7b2c8a3520afad0f8193a7e2e3b3ca058213e01c7cf39977",
+      "shape": [
+        1,
+        2,
+        9,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.8.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "fac2f03c3577b142d2c4a623d508802050b1db037df94811628e114219979a51",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_cast.tokenwise.step.8.values": {
+      "dtype": "<f2",
+      "sha256": "5d0db45988a4be1a1cf821ebb2229ec689bf23876448ba2afd458eae4b7f03b0",
+      "shape": [
+        1,
+        2,
+        9,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.9.conv_state": {
+      "dtype": "<f4",
+      "sha256": "741025dd26b8bb15408bafc0232442c8affa90a8b6f97c1813026401c5c6030c",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_cast.tokenwise.step.9.keys": {
+      "dtype": "<f2",
+      "sha256": "a14303f3e8b59760ecbb461868be6a81da121701c2cbed5172c79407631f50da",
+      "shape": [
+        1,
+        2,
+        10,
+        16
+      ]
+    },
+    "text.native_cast.tokenwise.step.9.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "e14e12aa6aaeb7db421513bb1ed6729e86f6c2494b00277f4f54627b69214263",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_cast.tokenwise.step.9.values": {
+      "dtype": "<f2",
+      "sha256": "980e8b96aceb79e4e30a31658984a0179e6790876372a4bb1049e1b8dadbc442",
+      "shape": [
+        1,
+        2,
+        10,
+        16
+      ]
+    },
+    "text.native_lowered.full.block.0": {
+      "dtype": "<f4",
+      "sha256": "ffb4133fabec53fa9778c651aaa737be7e13e10ecc06bffd964c17b61407b084",
+      "shape": [
+        1,
+        10,
+        24
+      ]
+    },
+    "text.native_lowered.full.block.1": {
+      "dtype": "<f4",
+      "sha256": "2f2733503d70dc1ce165dabd5d550de982920234858e649c0175fa44dd403886",
+      "shape": [
+        1,
+        10,
+        24
+      ]
+    },
+    "text.native_lowered.full.conv_state": {
+      "dtype": "<f4",
+      "sha256": "5c95991bd0fbb312d39b8b8f0f8e13cedb69c790e4017713f066e406cef28f16",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_lowered.full.keys": {
+      "dtype": "<f2",
+      "sha256": "0e246149c5445b97b6c938b2ac4bc430bb8ae93040e74a08758f5fa56b0281df",
+      "shape": [
+        1,
+        2,
+        10,
+        16
+      ]
+    },
+    "text.native_lowered.full.logits": {
+      "dtype": "<f4",
+      "sha256": "17e66783a86afdd03aeaf3506b39a4ae9b11f1a33effa18af6d6f1cfa5eaad4c",
+      "shape": [
+        1,
+        10,
+        64
+      ]
+    },
+    "text.native_lowered.full.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "542763d23677915bdf1c4ad3a7e091c0c0f1c4dd06fc2b7209dc020c7edb42e8",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_lowered.full.values": {
+      "dtype": "<f2",
+      "sha256": "f3f5699a14b387a1a0d82bbc358b923ded68fb54eed7d5ff0a69714bea3732b6",
+      "shape": [
+        1,
+        2,
+        10,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.0.conv_state": {
+      "dtype": "<f4",
+      "sha256": "b5ef9ca86491c92014ce03ac45e737e35d1121daec31468ca5b1fa524f6e54d4",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_lowered.tokenwise.step.0.keys": {
+      "dtype": "<f2",
+      "sha256": "bc42f41e8ffc81600f5413acaeabe0232eba150f6205eec32f9c45eaaa560271",
+      "shape": [
+        1,
+        2,
+        1,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.0.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "96ca074af22be56598cd26453f122bfdce08ba62f93c7305a7f27e9e32605c10",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_lowered.tokenwise.step.0.values": {
+      "dtype": "<f2",
+      "sha256": "c07947599537aaee4907535350f0d9d110b6b3fef802a782f34627788c193995",
+      "shape": [
+        1,
+        2,
+        1,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.1.conv_state": {
+      "dtype": "<f4",
+      "sha256": "4dc5d8e90d313d2aa1ff5858d28b5e8d462913d19aa50d23fdd3c841bb8a397b",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_lowered.tokenwise.step.1.keys": {
+      "dtype": "<f2",
+      "sha256": "a807efa5be57b219869a87858ef82b797db04c3778eff625be353867c7cb7dd0",
+      "shape": [
+        1,
+        2,
+        2,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.1.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "14bd70ac7f64b1460053f50c7cf5d81108827c10a6ac3faa46adb86c72b22372",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_lowered.tokenwise.step.1.values": {
+      "dtype": "<f2",
+      "sha256": "6d842051db5698c8e68dd55e2b9610d2c3ca02726fda3f8ff74f5629c2b92f97",
+      "shape": [
+        1,
+        2,
+        2,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.2.conv_state": {
+      "dtype": "<f4",
+      "sha256": "f9cdae9e3bafdf8ecede378da3c7381a42fbd8ed4987b7a3252cb31250e6d0d5",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_lowered.tokenwise.step.2.keys": {
+      "dtype": "<f2",
+      "sha256": "6671c8abd4fb39f458750f54a26063f0ccc93da02c7c28c289f89cc88077000e",
+      "shape": [
+        1,
+        2,
+        3,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.2.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "bf15de2e30c107066512377862ca57208a3a5afb1f9c2be8776d3f77b61779fd",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_lowered.tokenwise.step.2.values": {
+      "dtype": "<f2",
+      "sha256": "bda0e846b17a65d7107f1a44b2dacc482740664fddc1fa321e6540c9616b6b90",
+      "shape": [
+        1,
+        2,
+        3,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.3.conv_state": {
+      "dtype": "<f4",
+      "sha256": "c5c73a6bd616db7b7ad6fc9713b5878045b7af9a694d28e3f3ea805de1e7ef78",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_lowered.tokenwise.step.3.keys": {
+      "dtype": "<f2",
+      "sha256": "8b404100356448c923c6583adf6f4533af552f6bdcefaaae78c78cab6480adb0",
+      "shape": [
+        1,
+        2,
+        4,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.3.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "79229546a27adacdd3f0609604085805202f37f3dfb6cba3412eefd6d307ad40",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_lowered.tokenwise.step.3.values": {
+      "dtype": "<f2",
+      "sha256": "2c7da3bf6c156d1a0106783b13bc970603b204ba2ac348df949b93e3a185372a",
+      "shape": [
+        1,
+        2,
+        4,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.4.conv_state": {
+      "dtype": "<f4",
+      "sha256": "65e1d3af5f5fe782a89df442710816fd02e68a7da78c957821021cc743b5ec99",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_lowered.tokenwise.step.4.keys": {
+      "dtype": "<f2",
+      "sha256": "1dd5b4b38ae068eb38d9a81e9e15dee2753911760615456a54965c44e5c5d183",
+      "shape": [
+        1,
+        2,
+        5,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.4.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "77d44c7aab7f18b6be710b451c7c5aa81550ce8d98b1d5ddb1e3decb2a7baf30",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_lowered.tokenwise.step.4.values": {
+      "dtype": "<f2",
+      "sha256": "8ef9f96bc8519b76b250268f734a146890e8986e3cd72e0f54b893cc6063d1a1",
+      "shape": [
+        1,
+        2,
+        5,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.5.conv_state": {
+      "dtype": "<f4",
+      "sha256": "f1625ff75cace1a4e002edc12f209e3e0829f625886de6b21ae96bcc1bedbbd5",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_lowered.tokenwise.step.5.keys": {
+      "dtype": "<f2",
+      "sha256": "69e7dca3da8f1bcdf822fdefc1fb1abd9c73851841b6c7cc43cf648788e9af08",
+      "shape": [
+        1,
+        2,
+        6,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.5.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "a34a3690be31a1afc88594e4740f385ba0b8902c99d2506752126767ce964dd5",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_lowered.tokenwise.step.5.values": {
+      "dtype": "<f2",
+      "sha256": "8d0433a9c1ede7be4453ee900949f23804d38e1cf57cec3627efe71760376870",
+      "shape": [
+        1,
+        2,
+        6,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.6.conv_state": {
+      "dtype": "<f4",
+      "sha256": "b61be630fff9f6cb020bc8dfeeee5805624814d3244e10c992e0bd55f84b3d39",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_lowered.tokenwise.step.6.keys": {
+      "dtype": "<f2",
+      "sha256": "1d294519cc456ee6e70ca21a1eba2b30488003bc9b3671a099ac0239807bd525",
+      "shape": [
+        1,
+        2,
+        7,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.6.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "9f1c676ce3a1df7c0c78779a33f84b638cb2dc8b989c28f8b6744ee92c8a39a4",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_lowered.tokenwise.step.6.values": {
+      "dtype": "<f2",
+      "sha256": "7c5b47013cceb6077cc59c42d75f105342638d3541128cf885c6b8c76f5cf085",
+      "shape": [
+        1,
+        2,
+        7,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.7.conv_state": {
+      "dtype": "<f4",
+      "sha256": "6e7b10b6d59ac9cc5124e9195525c17c928aa98babb05738dc646ab2b5f231c7",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_lowered.tokenwise.step.7.keys": {
+      "dtype": "<f2",
+      "sha256": "5cf751c86df10e4db016542fa094fc5b64b8e4e0108a567f252c1338031b32c2",
+      "shape": [
+        1,
+        2,
+        8,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.7.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "97bdb2d2b4c3dda5d309628a7ede26e3ff544e32ce4e468fa07c32ae1a0a33d5",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_lowered.tokenwise.step.7.values": {
+      "dtype": "<f2",
+      "sha256": "cf7a3acbc7339cd30fbc933784a028e51eaa4fb528531b28e42c201b2dfff4bb",
+      "shape": [
+        1,
+        2,
+        8,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.8.conv_state": {
+      "dtype": "<f4",
+      "sha256": "55c9e2f51d099dc3db7174f6ca0e2ff49ba2671bdb8d8b90fbd736d6401e264e",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_lowered.tokenwise.step.8.keys": {
+      "dtype": "<f2",
+      "sha256": "ccbf1943b5d9967b098f338e8b4680717dbdf186a187e51de6b584b7d87811ef",
+      "shape": [
+        1,
+        2,
+        9,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.8.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "3480d43636e83c8ae0147cedf268bc141a643051dcb7dd0a29f732736c0e74ef",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_lowered.tokenwise.step.8.values": {
+      "dtype": "<f2",
+      "sha256": "5eb721f85fd7e6a136f005f60648445ce2da7264181a2bf5c72379fdd36b6fef",
+      "shape": [
+        1,
+        2,
+        9,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.9.conv_state": {
+      "dtype": "<f4",
+      "sha256": "7e2376c8f3fac492256aaeb1a7abb50867fff4fc50db47018d1514807dfd84a8",
+      "shape": [
+        1,
+        52,
+        4
+      ]
+    },
+    "text.native_lowered.tokenwise.step.9.keys": {
+      "dtype": "<f2",
+      "sha256": "0e246149c5445b97b6c938b2ac4bc430bb8ae93040e74a08758f5fa56b0281df",
+      "shape": [
+        1,
+        2,
+        10,
+        16
+      ]
+    },
+    "text.native_lowered.tokenwise.step.9.recurrent_state": {
+      "dtype": "<f4",
+      "sha256": "5079639d32c9d588a241f9e220c5aee473c8b4483f80d4b538ab6beca50a5ac3",
+      "shape": [
+        1,
+        6,
+        4,
+        6
+      ]
+    },
+    "text.native_lowered.tokenwise.step.9.values": {
+      "dtype": "<f2",
+      "sha256": "f3f5699a14b387a1a0d82bbc358b923ded68fb54eed7d5ff0a69714bea3732b6",
+      "shape": [
+        1,
+        2,
+        10,
+        16
       ]
     },
     "text.prefill_decode.block.0": {
@@ -2374,7 +3286,7 @@
     "path": "test/external/external_qwen_vl.py",
     "regenerate": "python test/external/external_qwen_vl.py --generate",
     "reproducibility": "--check-reproducible regenerates and compares BOTH files byte-for-byte",
-    "sha256": "3465ddb42ecc3ae00b35e2b5cc144a028db50fc3d8826c1c0c1d85a64a6b0494"
+    "sha256": "e1b3792d8dccc37500f526af1a14ff1139e2a2877516cad1cc7869c303be8803"
   },
   "layouts": {
     "coordinates.*.position_ids": "3,1,L (T,H,W); physical spans exclude delimiters, official not small-vocab IDs",
@@ -2576,11 +3488,265 @@
       }
     },
     "native_cast": {
-      "scope": "Proposed only: explicit tinygrad FP16 GDN and KV/cache cast oracle not captured here",
-      "status": "deferred_A2",
+      "algebra_drift": {
+        "block.0": {
+          "max_abs": 0.000338822603225708,
+          "max_relative": 0.00811075271096671,
+          "mean_abs": 5.7709003643443185e-05,
+          "mean_relative": 0.0005258887164298657,
+          "relative_denominator_floor": 1e-12
+        },
+        "block.1": {
+          "max_abs": 0.0003169327974319458,
+          "max_relative": 0.03420732591411181,
+          "mean_abs": 6.387603158752124e-05,
+          "mean_relative": 0.0007573548649732251,
+          "relative_denominator_floor": 1e-12
+        },
+        "conv_state": {
+          "max_abs": 0.0002692118287086487,
+          "max_relative": 0.12745063489931757,
+          "mean_abs": 6.839032665504e-05,
+          "mean_relative": 0.0011338089206818507,
+          "relative_denominator_floor": 1e-12
+        },
+        "keys": {
+          "max_abs": 0.0012602806091308594,
+          "max_relative": 0.0721731325828433,
+          "mean_abs": 0.00024996111387736163,
+          "mean_relative": 0.0008268163098221514,
+          "relative_denominator_floor": 1e-12
+        },
+        "logits": {
+          "max_abs": 0.0004566609859466553,
+          "max_relative": 0.11838414608686158,
+          "mean_abs": 8.09168135674554e-05,
+          "mean_relative": 0.0009972954881970913,
+          "relative_denominator_floor": 1e-12
+        },
+        "recurrent_state": {
+          "max_abs": 4.119612276554108e-05,
+          "max_relative": 0.02790230766427569,
+          "mean_abs": 6.376707258621334e-06,
+          "mean_relative": 0.0009363940337740593,
+          "relative_denominator_floor": 1e-12
+        },
+        "values": {
+          "max_abs": 0.0005855560302734375,
+          "max_relative": 0.026074098607882294,
+          "mean_abs": 0.00010708141417126171,
+          "mean_relative": 0.0007491222005218127,
+          "relative_denominator_floor": 1e-12
+        }
+      },
+      "lowered_fp32_weights": {
+        "algebra_drift": {
+          "block.0": {
+            "max_abs": 0.00012198835611343384,
+            "max_relative": 0.010470096689745186,
+            "mean_abs": 2.55087623372674e-05,
+            "mean_relative": 0.0003110150486554475,
+            "relative_denominator_floor": 1e-12
+          },
+          "block.1": {
+            "max_abs": 0.00013631582260131836,
+            "max_relative": 0.038360251345900626,
+            "mean_abs": 2.8242737365265687e-05,
+            "mean_relative": 0.0005251624112976313,
+            "relative_denominator_floor": 1e-12
+          },
+          "conv_state": {
+            "max_abs": 0.0,
+            "max_relative": 0.0,
+            "mean_abs": 0.0,
+            "mean_relative": 0.0,
+            "relative_denominator_floor": 1e-12
+          },
+          "keys": {
+            "max_abs": 0.0009450912475585938,
+            "max_relative": 0.06230281963941162,
+            "mean_abs": 0.00018141221735277214,
+            "mean_relative": 0.0005882699467493312,
+            "relative_denominator_floor": 1e-12
+          },
+          "logits": {
+            "max_abs": 0.00019288063049316406,
+            "max_relative": 0.03503789942861361,
+            "mean_abs": 3.7917481859039984e-05,
+            "mean_relative": 0.00046031402972549753,
+            "relative_denominator_floor": 1e-12
+          },
+          "recurrent_state": {
+            "max_abs": 0.0,
+            "max_relative": 0.0,
+            "mean_abs": 0.0,
+            "mean_relative": 0.0,
+            "relative_denominator_floor": 1e-12
+          },
+          "values": {
+            "max_abs": 0.00042998790740966797,
+            "max_relative": 0.03639581923764229,
+            "mean_abs": 7.8156099334592e-05,
+            "mean_relative": 0.0005965408374783232,
+            "relative_denominator_floor": 1e-12
+          }
+        },
+        "prefix": "text.native_lowered",
+        "scope": "Existing codegen/late/coalesce.py pm_simplify_add_image removes fused float->half->float roundtrips: FP32-weight GDN input stays FP32. Materialized GDN output and KV remain FP16. Separate HF cast-only oracle; compiler behavior is explicitly probed in native tests. Not quantized, BF16, FP16-weight or hardware acceptance.",
+        "self_variation": {
+          "chunked_block.0_vs_full": {
+            "max_abs": 0.0,
+            "max_relative": 0.0,
+            "mean_abs": 0.0,
+            "mean_relative": 0.0,
+            "relative_denominator_floor": 1e-12
+          },
+          "chunked_block.1_vs_full": {
+            "max_abs": 2.9802322387695312e-08,
+            "max_relative": 3.042483844867156e-07,
+            "mean_abs": 7.838631669680278e-10,
+            "mean_relative": 4.251552041516994e-09,
+            "relative_denominator_floor": 1e-12
+          },
+          "chunked_logits_vs_full": {
+            "max_abs": 1.1920928955078125e-07,
+            "max_relative": 1.3282896278606851e-05,
+            "mean_abs": 2.0285369828343392e-09,
+            "mean_relative": 4.623436476407494e-08,
+            "relative_denominator_floor": 1e-12
+          },
+          "embeddings_logits_vs_full": {
+            "max_abs": 0.0,
+            "max_relative": 0.0,
+            "mean_abs": 0.0,
+            "mean_relative": 0.0,
+            "relative_denominator_floor": 1e-12
+          },
+          "prefill_decode_block.0_vs_full": {
+            "max_abs": 5.960464477539063e-08,
+            "max_relative": 1.6378731441388709e-06,
+            "mean_abs": 6.4998554686705274e-09,
+            "mean_relative": 6.150310911760595e-08,
+            "relative_denominator_floor": 1e-12
+          },
+          "prefill_decode_block.1_vs_full": {
+            "max_abs": 8.940696716308594e-08,
+            "max_relative": 2.671660891426373e-05,
+            "mean_abs": 9.716798861821493e-09,
+            "mean_relative": 2.138408310664918e-07,
+            "relative_denominator_floor": 1e-12
+          },
+          "prefill_decode_logits_vs_full": {
+            "max_abs": 2.1606683731079102e-07,
+            "max_relative": 5.064457409057419e-05,
+            "mean_abs": 2.1247797121759505e-08,
+            "mean_relative": 2.594793174233152e-07,
+            "relative_denominator_floor": 1e-12
+          },
+          "tokenwise_block.0_vs_full": {
+            "max_abs": 1.1920928955078125e-07,
+            "max_relative": 1.6378731441388709e-06,
+            "mean_abs": 1.5952779601017634e-08,
+            "mean_relative": 1.307472541691418e-07,
+            "relative_denominator_floor": 1e-12
+          },
+          "tokenwise_block.1_vs_full": {
+            "max_abs": 1.1920928955078125e-07,
+            "max_relative": 2.671660891426373e-05,
+            "mean_abs": 2.814922481775284e-08,
+            "mean_relative": 3.5042449430283226e-07,
+            "relative_denominator_floor": 1e-12
+          },
+          "tokenwise_logits_vs_full": {
+            "max_abs": 2.384185791015625e-07,
+            "max_relative": 5.064457409057419e-05,
+            "mean_abs": 5.564725142903626e-08,
+            "mean_relative": 6.41349827834429e-07,
+            "relative_denominator_floor": 1e-12
+          }
+        },
+        "tolerance": {
+          "atol": 1e-05,
+          "rtol": 0.0001
+        }
+      },
+      "scope": "Official HF eager/F32 weights with explicit FP16-roundtrip GDN input and gated norm output; FP16 post-RoPE K/V cache, FP32 reads/arithmetic/conv/recurrent state. No algebra/layout patches. text.native_cast.* only; the original text.* HF algebra arrays remain unchanged.",
+      "self_variation": {
+        "chunked_block.0_vs_full": {
+          "max_abs": 0.0,
+          "max_relative": 0.0,
+          "mean_abs": 0.0,
+          "mean_relative": 0.0,
+          "relative_denominator_floor": 1e-12
+        },
+        "chunked_block.1_vs_full": {
+          "max_abs": 5.960464477539063e-08,
+          "max_relative": 3.640093298017957e-07,
+          "mean_abs": 6.984919309616089e-10,
+          "mean_relative": 4.29195390408793e-09,
+          "relative_denominator_floor": 1e-12
+        },
+        "chunked_logits_vs_full": {
+          "max_abs": 6.705522537231445e-08,
+          "max_relative": 6.593842484436213e-06,
+          "mean_abs": 2.1187588572502135e-09,
+          "mean_relative": 2.474593817122104e-08,
+          "relative_denominator_floor": 1e-12
+        },
+        "embeddings_logits_vs_full": {
+          "max_abs": 0.0,
+          "max_relative": 0.0,
+          "mean_abs": 0.0,
+          "mean_relative": 0.0,
+          "relative_denominator_floor": 1e-12
+        },
+        "prefill_decode_block.0_vs_full": {
+          "max_abs": 9.685754776000977e-08,
+          "max_relative": 6.59308780674341e-06,
+          "mean_abs": 5.8867347737153375e-09,
+          "mean_relative": 7.464293912571031e-08,
+          "relative_denominator_floor": 1e-12
+        },
+        "prefill_decode_block.1_vs_full": {
+          "max_abs": 1.2665987014770508e-07,
+          "max_relative": 6.439747149767912e-06,
+          "mean_abs": 8.544884622097016e-09,
+          "mean_relative": 1.350439749125191e-07,
+          "relative_denominator_floor": 1e-12
+        },
+        "prefill_decode_logits_vs_full": {
+          "max_abs": 2.384185791015625e-07,
+          "max_relative": 8.38646106360195e-05,
+          "mean_abs": 2.1307459974195808e-08,
+          "mean_relative": 3.4573431823576136e-07,
+          "relative_denominator_floor": 1e-12
+        },
+        "tokenwise_block.0_vs_full": {
+          "max_abs": 9.685754776000977e-08,
+          "max_relative": 6.59308780674341e-06,
+          "mean_abs": 1.5273690223693846e-08,
+          "mean_relative": 1.6558852895556007e-07,
+          "relative_denominator_floor": 1e-12
+        },
+        "tokenwise_block.1_vs_full": {
+          "max_abs": 1.2665987014770508e-07,
+          "max_relative": 6.439747149767912e-06,
+          "mean_abs": 2.421438694000244e-08,
+          "mean_relative": 2.418432389081983e-07,
+          "relative_denominator_floor": 1e-12
+        },
+        "tokenwise_logits_vs_full": {
+          "max_abs": 2.980232238769531e-07,
+          "max_relative": 8.38646106360195e-05,
+          "mean_abs": 5.4079282563179734e-08,
+          "mean_relative": 6.550163587527105e-07,
+          "relative_denominator_floor": 1e-12
+        }
+      },
+      "status": "captured",
       "tolerance": {
-        "atol": 0.02,
-        "rtol": 0.02
+        "atol": 1e-05,
+        "rtol": 0.0001
       }
     }
   },
