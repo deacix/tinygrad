@@ -1,23 +1,19 @@
 from __future__ import annotations
 import enum, functools, itertools, math, pathlib, threading
-from contextlib import contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from collections.abc import Callable
+from typing import cast
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.gguf import gguf_load, GGUFIndex, index_gguf, load_gguf_tensor
+from tinygrad.llm.gguf import gguf_load, GGUFIndex, index_gguf, load_gguf_tensor, _upload_placed_input
 from tinygrad.llm.placement import LayerPlacement, _placement_manifest
 from tinygrad.uop.ops import resolve
 from tinygrad.device import Device
-from tinygrad.dtype import DType
 
-
-def _upload_placed_input(data:list, dtype:DType, destination:str) -> Tensor:
-  # Coordinator inputs may upload asynchronously too; hold the actual _frompy source, not just its Python values.
-  source = Tensor(data, dtype=dtype, device='PYTHON').realize()
-  out = source.to(destination).realize()
-  Device[destination].synchronize()
-  return out
+def valid_temperature(value) -> bool:
+  try: return type(value) in (int, float) and math.isfinite(value) and value >= 0
+  except OverflowError: return False
 
 
 def _transfer_activation(x:Tensor, destination:str, mode:str) -> Tensor:
@@ -30,15 +26,10 @@ def _transfer_activation(x:Tensor, destination:str, mode:str) -> Tensor:
   if source_device == destination: return x
   if mode == 'native':
     out = x.to(destination).realize()
-    Device[source_device].synchronize()
-    Device[destination].synchronize()
+    for device in (source_device, destination): Device[device].synchronize()
     return out
   Device[source_device].synchronize()
-  # bytes owns the copyout; source owns _frompy's separate buffer until the destination is finished.
-  source = Tensor(bytes(x.data()), dtype=dtypes.uint8, device='PYTHON').realize()
-  out = source.to(destination).realize()
-  Device[destination].synchronize()
-  return out.bitcast(x.dtype).reshape(x.shape)
+  return _upload_placed_input(bytes(x.data()), dtypes.uint8, destination).bitcast(x.dtype).reshape(x.shape)
 
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
@@ -54,8 +45,7 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|
 
 class ExpertWeights:
   """Like Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
-  def __init__(self, num_experts:int, in_features:int, out_features:int):
-    self.weight = Tensor.zeros(num_experts, out_features, in_features)
+  def __init__(self, num_experts:int, in_features:int, out_features:int): self.weight = Tensor.zeros(num_experts, out_features, in_features)
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
     return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
@@ -70,8 +60,7 @@ def multimodal_freqs_cis(position_ids:Tensor, dim:int, theta:float, sections:tup
   # Interleaved T/H/W frequencies: H occupies 1,4,... and W 2,5,...; remaining frequencies use T.
   if len(sections) != 3 or any(s <= 0 for s in sections) or sum(sections)*2 != dim:
     raise ValueError("mRoPE sections must contain three positive counts summing to half the rotary dimension")
-  idx = Tensor.arange(dim//2).to(position_ids.device)
-  positions = position_ids.float().squeeze(1).unsqueeze(-1)
+  idx, positions = Tensor.arange(dim//2).to(position_ids.device), position_ids.float().squeeze(1).unsqueeze(-1)
   freqs = ((idx % 3 == 1) & (idx < 3*sections[1])).where(positions[1],
     ((idx % 3 == 2) & (idx < 3*sections[2])).where(positions[2], positions[0]))
   angles = freqs * (1.0 / (theta ** (idx.float() * 2 / dim)))
@@ -129,11 +118,10 @@ class TransformerConfig:
 
 def _llama_parameter_shapes(config:TransformerConfig) -> dict[str, tuple[int, ...]]:
   d, h, k = config.dim, config.hidden_dim, config.n_kv_heads*config.head_dim
-  shapes = {'token_embd.weight':(config.vocab_size,d), 'output_norm.weight':(d,), 'output.weight':(config.vocab_size,d)}
   block = {'attn_norm':(d,), 'ffn_norm':(d,), 'attn_q':(d,d), 'attn_k':(k,d), 'attn_v':(k,d), 'attn_output':(d,d),
            'ffn_gate':(h,d), 'ffn_up':(h,d), 'ffn_down':(d,h)}
-  shapes.update((f'blk.{i}.{name}.weight', shape) for i in range(config.num_blocks) for name,shape in block.items())
-  return shapes
+  return {'token_embd.weight':(config.vocab_size,d), 'output_norm.weight':(d,), 'output.weight':(config.vocab_size,d),
+          **{f'blk.{i}.{name}.weight':shape for i in range(config.num_blocks) for name,shape in block.items()}}
 
 
 def preflight_placement(index:GGUFIndex, placement:LayerPlacement, *, max_context:int|None=None,
@@ -150,22 +138,16 @@ def preflight_placement(index:GGUFIndex, placement:LayerPlacement, *, max_contex
   if 'general.quantization_version' in kv and (type(kv['general.quantization_version']) is not int or kv['general.quantization_version'] != 2):
     raise ValueError('unsupported GGUF quantization version for placement')
   def positive_int(key:str, default=None) -> int:
-    value = kv.get(key, default)
-    if type(value) is not int or value <= 0: raise ValueError(f'{key} must be a positive integer')
+    if type(value := kv.get(key, default)) is not int or value <= 0: raise ValueError(f'{key} must be a positive integer')
     return value
   def positive_float(key:str) -> float:
-    value = kv.get(key, 0)
-    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
-      raise ValueError(f'{key} must be finite and positive')
-    return float(value)
-  blocks = positive_int('llama.block_count')
-  placement = placement.validate(blocks)
-  dim, hidden = positive_int('llama.embedding_length'), positive_int('llama.feed_forward_length')
-  heads = positive_int('llama.attention.head_count')
+    if type(v := kv.get(key, 0)) not in (int, float) or not math.isfinite(v) or v <= 0: raise ValueError(f'{key} must be finite and positive')
+    return float(v)
+  placement = placement.validate(blocks := positive_int('llama.block_count'))
+  dim, hidden, heads = (positive_int(f'llama.{key}') for key in ('embedding_length', 'feed_forward_length', 'attention.head_count'))
   kv_heads = positive_int('llama.attention.head_count_kv', heads)
   head_dim = positive_int('llama.attention.key_length', dim//heads)
-  rope_dim = positive_int('llama.rope.dimension_count', head_dim)
-  value_dim = positive_int('llama.attention.value_length', head_dim)
+  rope_dim, value_dim = (positive_int(f'llama.{key}', head_dim) for key in ('rope.dimension_count', 'attention.value_length'))
   if dim != heads*head_dim or head_dim != rope_dim or head_dim != value_dim or rope_dim % 2 or heads % kv_heads:
     raise ValueError('placement requires full even-head RoPE, dim=heads*head_dim, equal Q/K/V head dimensions and divisible GQA')
   context = positive_int('llama.context_length')
@@ -188,9 +170,7 @@ def preflight_placement(index:GGUFIndex, placement:LayerPlacement, *, max_contex
   for key,value in kv.items():
     if key in ('general.tensor_data_layout', 'llama.tensor_data_layout') and value != 'reference':
       raise ValueError(f'unsupported placement metadata: {key}')
-    if not key.startswith('llama.'): continue
-    field = key[len('llama.'):]
-    if field in supported: continue
+    if not key.startswith('llama.') or (field := key[len('llama.'):]) in supported: continue
     if field not in neutral: raise ValueError(f'unsupported placement computation metadata: {key}')
     expected = neutral[field]
     if (type(value) is not type(expected) and not (type(expected) is float and type(value) is int)) or value != expected:
@@ -199,8 +179,7 @@ def preflight_placement(index:GGUFIndex, placement:LayerPlacement, *, max_contex
                              head_dim, positive_float('llama.rope.freq_base'), rope_dim, value_dim, max_context=context)
   # Bound manifest expansion by the already bounded descriptor inventory, not a potentially enormous metadata count.
   if not 2 + 9*blocks <= len(index.tensors) <= 4 + 9*blocks: raise ValueError('placed tensor count disagrees with block count')
-  shapes = _llama_parameter_shapes(config)
-  names = set()
+  shapes, names = _llama_parameter_shapes(config), set()
   for info in index.tensors:
     if info.name in names: raise ValueError(f'duplicate placed tensor: {info.name}')
     names.add(info.name)
@@ -208,8 +187,7 @@ def preflight_placement(index:GGUFIndex, placement:LayerPlacement, *, max_contex
     shape = (rope_dim//2,) if info.name == 'rope_freqs.weight' else shapes.get(info.name)
     if shape is None: raise ValueError(f'unsupported placed tensor: {info.name}')
     if info.shape != shape: raise ValueError(f'placed tensor shape mismatch: {info.name}: {info.shape} != {shape}')
-  missing = shapes.keys() - names - {'output.weight'}
-  if missing: raise ValueError(f'missing placed tensors: {sorted(missing)}')
+  if missing := shapes.keys() - names - {'output.weight'}: raise ValueError(f'missing placed tensors: {sorted(missing)}')
   return config, placement
 
 
@@ -218,24 +196,20 @@ class FFNBlock:
     self.config = config
 
     # --- RMSNorms --------------------------------------------------------
-    self.attn_norm   = nn.RMSNorm(config.dim, config.norm_eps)
-    self.ffn_norm    = nn.RMSNorm(config.dim, config.norm_eps)
+    self.attn_norm, self.ffn_norm = (nn.RMSNorm(config.dim, config.norm_eps) for _ in range(2))
 
     # --- feed-forward (MoE or dense) -------------------------------------
     if config.num_experts > 0:
       self.ffn_gate_inp = Linear(config.dim, config.num_experts, bias=False)  # router
       if config.expert_bias: self.exp_probs_b = {"bias": Tensor.zeros(config.num_experts)}
-      self.ffn_gate_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
-      self.ffn_up_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
+      self.ffn_gate_exps, self.ffn_up_exps = (ExpertWeights(config.num_experts, config.dim, config.hidden_dim) for _ in range(2))
       self.ffn_down_exps = ExpertWeights(config.num_experts, config.hidden_dim, config.dim)
       if config.shared_expert_dim > 0:
-        self.ffn_gate_shexp = Linear(config.dim, config.shared_expert_dim, bias=False)
-        self.ffn_up_shexp = Linear(config.dim, config.shared_expert_dim, bias=False)
+        self.ffn_gate_shexp, self.ffn_up_shexp = (Linear(config.dim, config.shared_expert_dim, bias=False) for _ in range(2))
         self.ffn_down_shexp = Linear(config.shared_expert_dim, config.dim, bias=False)
         if config.shared_expert_gate: self.ffn_gate_inp_shexp = {"weight": Tensor.zeros(config.dim)}
     else:
-      self.ffn_gate    = Linear(config.dim, config.hidden_dim, bias=False)
-      self.ffn_up      = Linear(config.dim, config.hidden_dim, bias=False)
+      self.ffn_gate, self.ffn_up = (Linear(config.dim, config.hidden_dim, bias=False) for _ in range(2))
       self.ffn_down    = Linear(config.hidden_dim, config.dim, bias=False)
 
   def _feed_forward(self, x:Tensor) -> Tensor:
@@ -290,11 +264,9 @@ class TransformerBlock(FFNBlock):
     assert config.v_head_dim == config.head_dim, "TransformerBlock requires v_head_dim == head_dim"
 
     # --- attention projections (all linear, bias-free) ------------------
-    q_proj_out       = config.head_dim * config.n_heads * (2 if config.attn_output_gate else 1)
-    kv_proj_out      = config.head_dim * config.n_kv_heads
+    q_proj_out, kv_proj_out = config.head_dim * config.n_heads * (2 if config.attn_output_gate else 1), config.head_dim * config.n_kv_heads
     self.attn_q      = Linear(config.dim, q_proj_out,  bias=config.qkv_bias)
-    self.attn_k      = Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
-    self.attn_v      = Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
+    self.attn_k, self.attn_v = (Linear(config.dim, kv_proj_out, bias=config.qkv_bias) for _ in range(2))
     self.attn_output = Linear(config.head_dim * config.n_heads, config.dim, bias=False)
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
 
@@ -306,36 +278,25 @@ class TransformerBlock(FFNBlock):
     if self.config.attn_output_gate:
       qg = q.reshape(B, T, self.config.n_heads, 2, self.config.head_dim)
       q, gate = qg[:, :, :, 0, :], qg[:, :, :, 1, :].reshape(B, T, self.config.n_heads * self.config.head_dim)
-    q = q.reshape(B, T, self.config.n_heads,    self.config.head_dim).transpose(1, 2)  # (B,H,T,Hd)
-    k = k.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
-    v = v.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
+    # (B,H,T,Hd), with fewer K/V heads for GQA.
+    q, k, v = (z.reshape(B, T, heads, self.config.head_dim).transpose(1, 2)
+               for z,heads in ((q,self.config.n_heads), (k,self.config.n_kv_heads), (v,self.config.n_kv_heads)))
     if self.config.qk_norm == self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     freqs = self.freqs_cis[start_pos:start_pos+T] if position_ids is None else \
       multimodal_freqs_cis(position_ids, self.config.rope_dim, self.config.rope_theta, self.config.rope_sections)
-    q = apply_rope(q[..., :self.config.rope_dim], freqs).cat(q[..., self.config.rope_dim:], dim=-1)
-    k = apply_rope(k[..., :self.config.rope_dim], freqs).cat(k[..., self.config.rope_dim:], dim=-1)
+    q, k = (apply_rope(z[..., :self.config.rope_dim], freqs).cat(z[..., self.config.rope_dim:], dim=-1) for z in (q, k))
 
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
     store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)
     assigned_kv = Tensor(self.cache_kv.uop.after(store))
     # on RDNA3, hybrid models use custom flash attention kernels on the KV cache
-    if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
-      attn = flash_attention(q, assigned_kv, start_pos+T)
-      attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
-      return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
-    k = assigned_kv[0, :, :, 0:start_pos+T, :]
-    v = assigned_kv[1, :, :, 0:start_pos+T, :]
-
-    #self.cache_kv[:, :, :, start_pos:start_pos+T, :].assign(Tensor.stack(k, v))
-    #k = self.cache_kv[0, :, :, 0:start_pos+T, :]
-    #v = self.cache_kv[1, :, :, 0:start_pos+T, :]
-
-    # NOTE: this mask is causal_lower_right, not the causal_upper_left generated by is_casual = True
-    # TODO: this if statement should be removed and it shouldn't generate extra kernels
-    mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, buffer=False).triu(start_pos+1) \
-      if resolve(T != 1) else None
-    attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
+    if amd_custom_kernels_supported(x.device) and self.config.ssm is not None: attn = flash_attention(q, assigned_kv, start_pos+T)
+    else:
+      k, v = (assigned_kv[i, :, :, 0:start_pos+T, :] for i in range(2))
+      # causal_lower_right, not the causal_upper_left generated by is_causal=True
+      mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, buffer=False).triu(start_pos+1) if resolve(T != 1) else None
+      attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)   # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
     return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
 
@@ -354,8 +315,7 @@ class MLATransformerBlock(FFNBlock):
       self.attn_q_a = Linear(config.dim, config.q_lora_rank, bias=False)
       self.attn_q_a_norm = nn.RMSNorm(config.q_lora_rank, config.norm_eps)
       self.attn_q_b = Linear(config.q_lora_rank, config.n_heads * config.head_dim, bias=False)
-    else:
-      self.attn_q = Linear(config.dim, config.n_heads * config.head_dim, bias=False)
+    else: self.attn_q = Linear(config.dim, config.n_heads * config.head_dim, bias=False)
     self.attn_kv_a_mqa = Linear(config.dim, config.kv_lora_rank + config.rope_dim, bias=False)
     self.attn_kv_a_norm = nn.RMSNorm(config.kv_lora_rank, config.norm_eps)
     self.attn_k_b = {"weight": Tensor.zeros(config.n_heads, config.kv_lora_rank, qk_nope_head_dim)}
@@ -380,8 +340,7 @@ class MLATransformerBlock(FFNBlock):
     k = Tensor(self.cache_k.uop.after(self.cache_k[:, :, start_pos:start_pos+T, :].uop.store(k_store.uop)))[:, :, 0:start_pos+T, :]
     v = k[..., :self.config.kv_lora_rank]
 
-    mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, buffer=False).triu(start_pos+1) \
-      if resolve(T != 1) else None
+    mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, buffer=False).triu(start_pos+1) if resolve(T != 1) else None
     attn = q @ k.transpose(-1, -2) * (1.0 / self.config.head_dim ** 0.5)
     if mask is not None: attn = attn + mask
     attn = attn.softmax(-1)
@@ -489,30 +448,24 @@ class GatedDeltaNetBlock(FFNBlock):
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device).clone()
 
 def _shape_only_llama(config:TransformerConfig) -> tuple[list[FFNBlock], nn.Embedding, nn.RMSNorm, Linear]:
-  # nn.Linear/Embedding call Tensor.rand, which allocates RNG seed/counter storage even without weight realization.
-  # Bypass those initializers locally, not via global monkeypatches. All placeholders are unrealized host buffers.
-  def norm(dim:int) -> nn.RMSNorm:
-    layer = nn.RMSNorm(dim, config.norm_eps, elementwise_affine=False)
-    layer.weight = Tensor.empty(dim, device='PYTHON')
-    return layer
-  def linear(out_features:int, in_features:int) -> Linear:
-    layer = Linear.__new__(Linear)
-    layer.in_features, layer.out_features, layer.bias = in_features, out_features, None
-    layer.use_custom_quant = False
-    layer.weight = Tensor.empty(out_features, in_features, device='PYTHON')
-    return layer
-  blocks:list[FFNBlock] = []
-  for _ in range(config.num_blocks):
-    block = TransformerBlock.__new__(TransformerBlock)
-    block.config = config
-    blocks.append(block)
+  # Bypass random Linear/Embedding initializers, which allocate RNG storage even without weight realization.
+  blocks:list[FFNBlock] = [TransformerBlock.__new__(TransformerBlock) for _ in range(config.num_blocks)]
+  for block in blocks: block.config = config
+  endpoints = {}
   for name,shape in _llama_parameter_shapes(config).items():
+    layer:nn.RMSNorm|nn.Embedding|Linear
+    if len(shape) == 1: layer = nn.RMSNorm(shape[0], config.norm_eps, elementwise_affine=False)
+    elif name == 'token_embd.weight': layer = nn.Embedding.__new__(nn.Embedding)
+    else:
+      layer = Linear.__new__(Linear)
+      layer.out_features, layer.in_features, layer.bias, layer.use_custom_quant = *shape, None, False
+    layer.weight = Tensor.empty(*shape, device='PYTHON')
     if name.startswith('blk.'):
       _, index, component, _ = name.split('.')
-      setattr(blocks[int(index)], component, norm(shape[0]) if len(shape) == 1 else linear(*shape))
-  embedding = nn.Embedding.__new__(nn.Embedding)
-  embedding.weight = Tensor.empty(config.vocab_size, config.dim, device='PYTHON')
-  return blocks, embedding, norm(config.dim), linear(config.vocab_size, config.dim)
+      setattr(blocks[int(index)], component, layer)
+    else: endpoints[name] = layer
+  return blocks, cast(nn.Embedding, endpoints['token_embd.weight']), cast(nn.RMSNorm, endpoints['output_norm.weight']), \
+    cast(Linear, endpoints['output.weight'])
 
 
 class PlacedInferenceError(RuntimeError):
@@ -529,8 +482,7 @@ class PlacedModelBusyError(RuntimeError): pass
 class _LayerStage:
   __slots__ = ('device', '_forward', 'single_jit', 'chunk_jit', 'chunk_size')
 
-  def __init__(self, device:str, blocks:list[FFNBlock], embedding:nn.Embedding|None,
-               norm:nn.RMSNorm|None, output:Linear|None, chunk_size:int):
+  def __init__(self, device:str, blocks:list[FFNBlock], embedding:nn.Embedding|None, norm:nn.RMSNorm|None, output:Linear|None, chunk_size:int):
     self.device, self.chunk_size = device, chunk_size
     # No parent pointer or second registered weight tree: closures live behind the slotted executor.
     def forward(value:Tensor, start_pos:UOp) -> Tensor:
@@ -538,9 +490,7 @@ class _LayerStage:
       for block in blocks: x = block(x, start_pos)
       if norm is not None and output is not None: x = output(norm(x[:, -1:]))[:, -1, :]
       return x.float().contiguous().realize()
-    self._forward = forward
-    self.single_jit = TinyJit(forward)
-    self.chunk_jit = TinyJit(forward) if chunk_size > 1 else None
+    self._forward, self.single_jit, self.chunk_jit = forward, TinyJit(forward), TinyJit(forward) if chunk_size > 1 else None
 
   def run(self, value:Tensor, start_pos:UOp, *, jit:bool=True) -> Tensor:
     runner = self.single_jit if value.shape[1] == 1 else self.chunk_jit if value.shape[1] == self.chunk_size else None
@@ -552,8 +502,7 @@ class _PlacedExecutor:
   __slots__ = ('stages', 'placement', 'config', 'state', 'lock', 'owner')
 
   def __init__(self, model:Transformer, config:TransformerConfig, placement:LayerPlacement):
-    self.placement, self.config = placement, config
-    self.state, self.lock = 'ready', threading.Lock()
+    self.placement, self.config, self.state, self.lock = placement, config, 'ready', threading.Lock()
     self.owner:object|None = None
     stages, start = [], 0
     for i,(device,count) in enumerate(zip(placement.devices, placement.layer_counts)):
@@ -564,9 +513,8 @@ class _PlacedExecutor:
                                       dtype=dtypes.half, device=device).contiguous().realize()
         block.freqs_cis = precompute_freqs_cis(config.rope_dim, config.max_context, config.rope_theta, device).float().contiguous().realize()
       Device[device].synchronize()
-      last = i == len(placement.devices)-1
       stages.append(_LayerStage(device, model.blk[start:start+count], model.token_embd if i == 0 else None,
-                                model.output_norm if last else None, model.output if last else None, placement.chunk_size))
+        model.output_norm if (last := i == len(placement.devices)-1) else None, model.output if last else None, placement.chunk_size))
       start += count
     self.stages = tuple(stages)
 
@@ -576,14 +524,12 @@ class Transformer:
   _placed: _PlacedExecutor
 
   def __setattr__(self, name, value):
-    if name in ('placement', 'max_context') and hasattr(self, '_placed'):
-      raise ValueError('placed configuration is immutable; reload required')
+    if name in ('placement', 'max_context') and hasattr(self, '_placed'): raise ValueError('placed configuration is immutable; reload required')
     super().__setattr__(name, value)
 
   def __init__(self, config:TransformerConfig, *, _shape_only:bool=False):
     self.blk:list[FFNBlock]
-    if _shape_only:
-      self.blk, self.token_embd, self.output_norm, self.output = _shape_only_llama(config)
+    if _shape_only: self.blk, self.token_embd, self.output_norm, self.output = _shape_only_llama(config)
     else:
       dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0,
                              hidden_dim=config.dense_hidden_dim or config.hidden_dim)
@@ -599,11 +545,9 @@ class Transformer:
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
     # we specialize the JIT for prefill and rollout
-    self.prefill_jit = TinyJit(self.forward)
-    self.rollout_jit = TinyJit(self.forward)
+    self.prefill_jit, self.rollout_jit = (TinyJit(self.forward) for _ in range(2))
     self.multimodal_rollout_jit = TinyJit(self._multimodal_decode)
-    self._generation_epoch = 0
-    self._multimodal_active = False
+    self._generation_epoch, self._multimodal_active = 0, False
 
   def forward_embeddings(self, x:Tensor, start_pos:int|UOp, position_ids:Tensor|None=None) -> Tensor:
     if hasattr(self, 'placement'): raise ValueError('placement does not support public embeddings')
@@ -612,8 +556,7 @@ class Transformer:
         raise ValueError("multimodal embeddings must be float32 [1, L, decoder_dim]")
       physical = start_pos if isinstance(start_pos, int) else start_pos.unbind()[1]
       if not 0 <= physical < physical+x.shape[1] <= self.max_context: raise ValueError("physical positions must fit the context")
-      if position_ids.shape != (3, 1, x.shape[1]) or position_ids.dtype != dtypes.int32:
-        raise ValueError("position_ids must be int32 [3, 1, L]")
+      if position_ids.shape != (3, 1, x.shape[1]) or position_ids.dtype != dtypes.int32: raise ValueError("position_ids must be int32 [3, 1, L]")
       if position_ids.device != x.device or x.device != self.token_embd.weight.device:
         raise ValueError("embeddings and positions must be on the decoder device")
       if any(isinstance(b, MLATransformerBlock) for b in self.blk): raise ValueError("mRoPE is not supported for MLA")
@@ -644,17 +587,14 @@ class Transformer:
         raise ValueError('placed configuration changed; reload required')
       # Input readback must share admission's lock, but invalid values must not poison committed caches.
       if validate is not None: validate()
-      owner = object()
-      executor.owner, executor.state = owner, 'generating'
+      executor.owner, executor.state = (owner := object()), 'generating'
       try: yield owner
       except BaseException as exc:
         executor.state, self._cached_tokens = 'failed', []
         if isinstance(exc, Exception) and not isinstance(exc, PlacedInferenceError):
           raise PlacedInferenceError(None, executor.placement.devices[-1], operation) from None
         raise
-      finally:
-        executor.owner = None
-        if executor.state != 'failed': executor.state = 'ready'
+      finally: executor.owner, executor.state = None, 'failed' if executor.state == 'failed' else 'ready'
     finally: executor.lock.release()
 
   @contextmanager
@@ -688,15 +628,13 @@ class Transformer:
     if tokens.device != self.placement.devices[0]: raise ValueError('placed tokens must be on the first owner')
     try: pos = start_pos.unbind()[1] if isinstance(start_pos, UOp) else start_pos
     except (AssertionError, ValueError): raise ValueError('placed start_pos must be an integer or bound variable') from None
-    if type(pos) is not int or not 0 <= pos < pos+tokens.shape[1] <= self.max_context:
-      raise ValueError('placed token positions must fit the context')
+    if type(pos) is not int or not 0 <= pos < pos+tokens.shape[1] <= self.max_context: raise ValueError('placed token positions must fit the context')
     if tokens.shape[1] > self.placement.chunk_size: raise ValueError('placed token count exceeds fixed chunk size')
     return pos
 
   def _placed_step(self, tokens:Tensor, start_pos:int|UOp, *, jit:bool=True, owner:object|None=None) -> Tensor:
     if owner is None or owner is not self._placed.owner: raise PlacedModelBusyError('placed step requires its transaction owner')
-    pos = self._placed_position(tokens, start_pos)
-    sp = UOp.variable('start_pos', 0, self.max_context-1).bind(pos)
+    sp = UOp.variable('start_pos', 0, self.max_context-1).bind(self._placed_position(tokens, start_pos))
     with self._placed_operation(0, 'input'): value = tokens.contiguous().realize()
     for i,stage in enumerate(self._placed.stages):
       if i:
@@ -725,8 +663,7 @@ class Transformer:
       if realize: raise ValueError('explicit placement requires REALIZE=0')
       index = index_gguf(gguf)
       config, placement = preflight_placement(index, placement, max_context=max_context, realize=realize)
-      manifest = _placement_manifest(index, placement)
-      model = Transformer(config, _shape_only=True)
+      manifest, model = _placement_manifest(index, placement), Transformer(config, _shape_only=True)
       parameters = nn.state.get_state_dict(model)
       # Check construction against the complete validated manifest before the very first payload transfer.
       if parameters.keys() != {name for name,_,_ in manifest} or any(parameters[n].shape != info.shape for n,info,_ in manifest):
@@ -734,8 +671,7 @@ class Transformer:
       model.placement = placement
       loaded:dict[tuple[int, int, int, str], Tensor] = {}
       for name,info,owner in manifest:
-        key = (info.part, info.offset, info.nbytes, owner)
-        if key not in loaded:
+        if (key := (info.part, info.offset, info.nbytes, owner)) not in loaded:
           weight = load_gguf_tensor(index, info, device=owner)
           if getenv('HALF', 1): weight = weight.half()
           # Full-head Llama RoPE: interleaved rows to half-split, matching the legacy Q/K transforms below.
@@ -800,26 +736,20 @@ class Transformer:
       num_blocks=kv[f'{arch}.block_count'] - kv.get(f'{arch}.nextn_predict_layers', 0), dim=kv[f'{arch}.embedding_length'],
       hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv.get(f'{arch}.feed_forward_length', 0)),
       n_heads=n_heads, n_kv_heads=n_kv_heads, norm_eps=kv[f'{arch}.attention.layer_norm_rms_epsilon'],
-      vocab_size=len(kv['tokenizer.ggml.tokens']),
-      head_dim=head_dim,
-      rope_theta=kv[f'{arch}.rope.freq_base'],
-      rope_dim=rope_dim,
-      v_head_dim=kv.get(f'{arch}.attention.value_length_mla', kv.get(f'{arch}.attention.value_length', head_dim)),
-      max_context=max_context,
+      vocab_size=len(kv['tokenizer.ggml.tokens']), head_dim=head_dim, rope_theta=kv[f'{arch}.rope.freq_base'], rope_dim=rope_dim,
+      v_head_dim=kv.get(f'{arch}.attention.value_length_mla', kv.get(f'{arch}.attention.value_length', head_dim)), max_context=max_context,
       qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
       num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
       norm_topk_prob=kv.get(f'{arch}.expert_weights_norm', arch in ('qwen3moe', 'qwen35moe', 'kimi-linear')),
       expert_gating_func=ExpertGating(kv.get(f'{arch}.expert_gating_func', ExpertGating.SOFTMAX)),
       kv_lora_rank=kv_lora_rank, q_lora_rank=kv.get(f'{arch}.attention.q_lora_rank', 0),
       leading_dense_blocks=kv.get(f'{arch}.leading_dense_block_count', 0),
-      shared_expert_dim=kv.get(
-        f'{arch}.expert_shared_feed_forward_length',
-        kv.get(f'{arch}.expert_shared_count', 0) * kv.get(f'{arch}.expert_feed_forward_length', 0)),
+      shared_expert_dim=kv.get(f'{arch}.expert_shared_feed_forward_length',
+                               kv.get(f'{arch}.expert_shared_count', 0) * kv.get(f'{arch}.expert_feed_forward_length', 0)),
       shared_expert_gate=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.ffn_gate_inp_shexp.weight" in state_dict,
       dense_hidden_dim=kv.get(f'{arch}.feed_forward_length', 0) if kv.get(f'{arch}.leading_dense_block_count', 0) else 0,
       routed_scaling_factor=kv.get(f'{arch}.expert_weights_scale', 1.0), attn_output_gate=arch in ('qwen35', 'qwen35moe'), ssm=ssm,
-      ssm_layers=ssm_layers,
-      qkv_bias='blk.0.attn_q.bias' in state_dict,
+      ssm_layers=ssm_layers, qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
     model = Transformer(config)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
@@ -832,19 +762,15 @@ class Transformer:
   def warmup(self):
     if hasattr(self, '_placed'):
       with self._placed_transaction('warmup') as owner:
-        self._cached_tokens = []
-        try:
-          for count in dict.fromkeys((1, self._placed.placement.chunk_size)):
-            for i in range(3):  # first eager, then capture, then replay
-              tokens = _upload_placed_input([[i % self._placed.config.vocab_size]*count], dtypes.int32, self._placed.placement.devices[0])
-              self._placed_step(tokens, 0, owner=owner)
-          for stage in self._placed.stages: Device[stage.device].synchronize()
-        finally: self._cached_tokens = []
+        self._cached_tokens = []  # steps never publish history; the transaction clears it on failure too
+        for count in dict.fromkeys((1, self._placed.placement.chunk_size)):
+          for i in range(3):  # first eager, then capture, then replay
+            tokens = _upload_placed_input([[i % self._placed.config.vocab_size]*count], dtypes.int32, self._placed.placement.devices[0])
+            self._placed_step(tokens, 0, owner=owner)
+        for stage in self._placed.stages: Device[stage.device].synchronize()
       return
     for _ in range(2):
-      gen = self.generate([0])
-      try: list(zip(range(2), gen))
-      finally: gen.close()
+      with closing(self.generate([0])) as gen: list(zip(range(2), gen))
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
@@ -855,21 +781,15 @@ class Transformer:
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
   def reset_generation_state(self):
-    if hasattr(self, '_placed'):
-      with self._placed_transaction('reset'):
-        self._cached_tokens = []
-        self._generation_epoch += 1
-      return
     # Position zero resets GDN and overwrites the valid KV prefix. Never replace buffers captured by a JIT.
-    self._cached_tokens = []
-    self._generation_epoch += 1
-    self._multimodal_active = False
+    with self._placed_transaction('reset') if hasattr(self, '_placed') else nullcontext():
+      self._cached_tokens, self._generation_epoch = [], self._generation_epoch+1
+      if not hasattr(self, '_placed'): self._multimodal_active = False
 
   def _generate_multimodal(self, tokens:list[int], chunk_size:int, temperature:float,
                            inputs_embeds:Tensor|None, position_ids:Tensor|None, rope_delta:int):
     self.reset_generation_state()
-    epoch = self._generation_epoch
-    self._multimodal_active = True
+    epoch, self._multimodal_active = self._generation_epoch, True
     try:
       length, device = len(tokens), self.token_embd.weight.device
       if not isinstance(inputs_embeds, Tensor) or not isinstance(position_ids, Tensor):
@@ -879,14 +799,10 @@ class Transformer:
         raise ValueError("inputs_embeds must be float32 [1, prompt_length, decoder_dim]")
       if position_ids.shape != (3, 1, length) or position_ids.dtype != dtypes.int32:
         raise ValueError("position_ids must be int32 [3, 1, prompt_length]")
-      if inputs_embeds.device != device or position_ids.device != device:
-        raise ValueError("embeddings and positions must be on the decoder device")
+      if inputs_embeds.device != device or position_ids.device != device: raise ValueError("embeddings and positions must be on the decoder device")
       if type(chunk_size) is not int or chunk_size <= 0: raise ValueError("chunk_size must be positive")
-      try: valid_temperature = type(temperature) in (float, int) and math.isfinite(temperature) and temperature >= 0
-      except OverflowError: valid_temperature = False
-      if not valid_temperature: raise ValueError("temperature must be finite and nonnegative")
-      if type(rope_delta) is not int or not 0 <= length+rope_delta <= self.max_context+rope_delta < 2**31:
-        raise ValueError("invalid rope_delta")
+      if not valid_temperature(temperature): raise ValueError("temperature must be finite and nonnegative")
+      if type(rope_delta) is not int or not 0 <= length+rope_delta <= self.max_context+rope_delta < 2**31: raise ValueError("invalid rope_delta")
       if any(type(t) is not int or not 0 <= t < self.token_embd.weight.shape[0] for t in tokens): raise ValueError("invalid token ID")
       # Value checks are request-boundary work, never copyouts inside the decode JIT.
       if not inputs_embeds.isfinite().all().item() or not (position_ids >= 0).all().item():
@@ -895,21 +811,18 @@ class Transformer:
       if length == self.max_context: return
       temp = Tensor([temperature], dtype=dtypes.float32, device=device).realize()
       # Eager bounded chunks also on CPU GDN; unlike text prefill, do not force token-serial processing.
-      chunk_size = min(chunk_size, 32)
-      physical = UOp.variable("start_pos", 0, self.max_context-1)
+      chunk_size, physical = min(chunk_size, 32), UOp.variable("start_pos", 0, self.max_context-1)
       for start in range(0, length, chunk_size):
         end = min(start+chunk_size, length)
         logits = self.forward_embeddings(inputs_embeds[:, start:end].contiguous(), physical.bind(start),
                                          position_ids[:, :, start:end].contiguous()).realize()
       out = self._sample(logits, temp).realize()
       # Owned, realized buffers keep identical dtype/view/device signatures across requests and JIT replay.
-      token = Tensor.empty(1, 1, dtype=dtypes.int32, device=device).realize()
-      coords = Tensor.empty(3, 1, 1, dtype=dtypes.int32, device=device).realize()
+      token, coords = (Tensor.empty(*shape, dtype=dtypes.int32, device=device).realize() for shape in ((1, 1), (3, 1, 1)))
       while length < self.max_context:
         tokens.append(int(out.item()))
         yield tokens[-1]
-        if epoch != self._generation_epoch: return
-        if length+1 == self.max_context: return
+        if epoch != self._generation_epoch or length+1 == self.max_context: return
         token.assign(Tensor([[tokens[-1]]], dtype=dtypes.int32, device=device)).realize()
         coords.assign(Tensor.full((3, 1, 1), length+rope_delta, dtype=dtypes.int32, device=device)).realize()
         out = self.multimodal_rollout_jit(token, physical.bind(length), coords, temp).realize()
@@ -919,26 +832,20 @@ class Transformer:
       if epoch == self._generation_epoch: self.reset_generation_state()
 
   def _generate_placed(self, tokens:list[int], chunk_size:int, temperature:float):
-    if type(chunk_size) is not int or chunk_size != self.placement.chunk_size:
-      raise ValueError('placed chunk_size is fixed at load time')
+    if type(chunk_size) is not int or chunk_size != self.placement.chunk_size: raise ValueError('placed chunk_size is fixed at load time')
     if not isinstance(tokens, list) or not 0 < len(tokens) <= self.max_context or any(
         type(t) is not int or not 0 <= t < self._placed.config.vocab_size for t in tokens): raise ValueError('invalid placed prompt tokens')
-    try: valid_temperature = type(temperature) in (int, float) and math.isfinite(temperature) and temperature >= 0
-    except OverflowError: valid_temperature = False
-    if not valid_temperature: raise ValueError('temperature must be finite and nonnegative')
+    if not valid_temperature(temperature): raise ValueError('temperature must be finite and nonnegative')
     with self._placed_transaction('generation') as owner:
       temp = _upload_placed_input([temperature], dtypes.float32, self._placed.placement.devices[-1])
-      pos = self.get_start_pos(tokens)
       # Own the working history, so a caller mutating its list between yields cannot corrupt prefix metadata.
-      history = tokens.copy()
+      pos, history = self.get_start_pos(tokens), tokens.copy()
       while len(history) < self.max_context:
         end = min(pos+chunk_size, len(history))
         value = _upload_placed_input([history[pos:end]], dtypes.int32, self._placed.placement.devices[0])
-        logits = self._placed_step(value, pos, owner=owner)
-        pos = end
+        logits, pos = self._placed_step(value, pos, owner=owner), end
         if pos < len(history): continue
-        with self._placed_operation(len(self._placed.stages)-1, 'sample'):
-          token = int(self._placed_sample(logits, temp).item())
+        with self._placed_operation(len(self._placed.stages)-1, 'sample'): token = int(self._placed_sample(logits, temp).item())
         history.append(token)
         tokens.append(token)  # retain the legacy list-append surface
         self._cached_tokens = history[:-1]
@@ -959,15 +866,13 @@ class Transformer:
     self._generation_epoch += 1
     epoch = self._generation_epoch
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
-    v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
-    v_toks = UOp.variable("toks", 1, chunk_size)
+    v_start_pos, v_toks = UOp.variable("start_pos", 0, self.max_context-1), UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
     temp = Tensor([temperature])
     # assign all input tokens once, then slice from start_pos for the model call
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
-    start_pos = self.get_start_pos(tokens)
-    out, prompt_len = None, len(tokens)
+    start_pos, out, prompt_len = self.get_start_pos(tokens), None, len(tokens)
     while len(tokens) < self.max_context:
       n_toks = min(chunk_size, len(tokens) - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)

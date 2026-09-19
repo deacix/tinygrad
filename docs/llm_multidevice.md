@@ -141,6 +141,7 @@ hosts requiring a compiler target can use the [DEV configuration](env_vars.md#de
 ```sh
 python -m ruff check .
 python -m mypy tinygrad/
+MAX_LINE_COUNT=26500 python3.11 sz.py  # match CI's tokenizer-based repository size gate (requires tabulate)
 DEV=CPU BEAM=0 python -m pytest -x -q -n12 \
   test/unit/test_gguf_placement.py \
   test/unit/test_llm_placement.py \

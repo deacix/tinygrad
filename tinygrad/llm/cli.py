@@ -1,6 +1,7 @@
 from __future__ import annotations
 import sys, argparse, codecs, itertools, typing, re, unicodedata, json, time
 from typing import TYPE_CHECKING
+from contextlib import closing
 from pathlib import Path
 from tinygrad import nn
 from tinygrad.uop.ops import UOp, Ops
@@ -43,8 +44,7 @@ class SimpleTokenizer:
     self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
     self._special_tokens = special_tokens
     self._tok2bytes = {tid: tok for tok, tid in self._normal_tokens.items()} | {tid: tok.encode() for tok, tid in self._special_tokens.items()}
-    self.preset = preset
-    self.bos_id, self.eos_id, self.eot_id = bos_id, eos_id, eot_id
+    self.preset, self.bos_id, self.eos_id, self.eot_id = preset, bos_id, eos_id, eot_id
 
   @staticmethod
   def from_gguf_kv(kv:dict):
@@ -109,22 +109,13 @@ class FallbackTemplate:
   # minimal jinja2.Template-compatible chat template without jinja2, no tool calling support
   def __init__(self, tok:SimpleTokenizer): self.tok = tok
   def role(self, role:str) -> str:
-    if self.tok.preset == 'olmo': return "<|" + role + "|>\n"  # OLMoE Instruct format
-    if self.tok.preset == 'kimi-k2': return "<|im_" + role + "|>" + role + "<|im_middle|>"
-    if self.tok.preset == 'qwen2': return "<|im_start|>" + role + "\n"
-    if self.tok.preset == 'glm4': return "<|" + role + "|>"
-    if self.tok.preset == 'tekken':
-      if role == 'user': return "[INST]"
-      if role == 'assistant': return ""
-      raise ValueError(f"Unsupported role '{role}' for tokenizer preset '{self.tok.preset}'")
-    return "<|start_header_id|>" + role + "<|end_header_id|>\n\n"
+    formats = {'olmo':"<|{0}|>\n", 'kimi-k2':"<|im_{0}|>{0}<|im_middle|>", 'qwen2':"<|im_start|>{0}\n", 'glm4':"<|{0}|>"}
+    if self.tok.preset != 'tekken': return formats.get(self.tok.preset, "<|start_header_id|>{0}<|end_header_id|>\n\n").format(role)
+    if role in ('user', 'assistant'): return "[INST]" if role == 'user' else ""
+    raise ValueError(f"Unsupported role '{role}' for tokenizer preset '{self.tok.preset}'")
   def end_turn(self) -> str:
-    if self.tok.preset == 'olmo': return "\n"
-    if self.tok.preset == 'kimi-k2': return self.tok.decode([self.tok.eos_id])
-    if self.tok.preset == 'qwen2': return self.tok.decode([self.tok.eos_id]) + "\n"
-    if self.tok.preset == 'glm4': return ""
-    if self.tok.preset == 'tekken': return "[/INST]"
-    return self.tok.decode([self.tok.eos_id])
+    if self.tok.preset in (fixed := {'olmo':"\n", 'glm4':"", 'tekken':"[/INST]"}): return fixed[self.tok.preset]
+    return self.tok.decode([self.tok.eos_id]) + ("\n" if self.tok.preset == 'qwen2' else "")
   def render(self, messages:list[dict], tools=None, add_generation_prompt:bool=True, preserve_thinking:bool=False) -> str:
     out = self.tok.decode([] if self.tok.bos_id is None else [self.tok.bos_id]) + ("<sop>" if self.tok.preset == 'glm4' else "")
     for msg in messages:
@@ -198,11 +189,9 @@ def parse_args(argv:list[str]|None=None):
 def report_placement(placement:LayerPlacement, memory:tuple[PlacementMemory, ...], context:int, vocab_size:int):
   print(f"experimental layer placement: CPU-validated software only; fit unknown; max context {context}, "
         f"chunk {placement.chunk_size}, transfer {placement.transfer}")
-  start = 0
-  for count, m in zip(placement.layer_counts, memory):
+  for start, count, m in zip(itertools.accumulate(placement.layer_counts, initial=0), placement.layer_counts, memory):
     print(f"{m.device} blocks=[{start},{start+count}) raw_weight_bytes={m.weight_bytes} tied_replica_bytes={m.tied_replica_bytes} "
           f"kv_bytes={m.kv_bytes} rope_bytes={m.rope_bytes} boundary_bytes={m.boundary_bytes} largest_payload_bytes={m.largest_payload_bytes}")
-    start += count
   print(f"embedding owner={placement.devices[0]}; output norm/projection owner={placement.devices[-1]}; "
         f"logits_bytes={vocab_size*4} owner={placement.devices[-1]} (provision)")
   print("tied_replica_bytes is a subset of raw_weight_bytes, not an additional charge; boundaries provision two FP32 chunk buffers per stage.")
@@ -216,11 +205,10 @@ def main():
   # Explicit placement never resolves aliases/URLs or calls fetch, even for local files.
   model_path = Path(args.model) if args.placement is not None else fetch(models.get(args.model, args.model))
   if args.placement is not None:
-    index = index_gguf(model_path)
-    config, args.placement = preflight_placement(index, args.placement, max_context=args.max_context, realize=bool(getenv('REALIZE', 0)))
-    memory = estimate_placement(index, config, args.placement)
-    del index  # Keep only scalar accounting; no source manifest or registered cache/JIT state in reports.
-    report_placement(args.placement, memory, config.max_context, config.vocab_size)
+    config, args.placement = preflight_placement(index := index_gguf(model_path), args.placement,
+                                                max_context=args.max_context, realize=bool(getenv('REALIZE', 0)))
+    report_placement(args.placement, estimate_placement(index, config, args.placement), config.max_context, config.vocab_size)
+    del index  # Keep no source manifest or registered cache/JIT state in reports.
     if args.placement_check: return
   vision = image_limits = None
   if args.vision_dir:
@@ -272,15 +260,14 @@ def main():
     prompt = prepare_prompt([{"role":"user", "content":content}], tok, template, limits=image_limits,
                             device=vision_device, max_context=model.max_context)
     embeddings = embed_prompt(model, vision, prompt)
-    gen = model.generate(list(prompt.tokens), inputs_embeds=embeddings, position_ids=prompt.position_ids, rope_delta=prompt.rope_delta)
     dec = tok.stream_decoder()
-    try:
+    with closing(model.generate(list(prompt.tokens), inputs_embeds=embeddings,
+                                position_ids=prompt.position_ids, rope_delta=prompt.rope_delta)) as gen:
       for _, next_id in zip(range(min(args.max_output_tokens, model.max_context-len(prompt.tokens))), gen):
         if tok.is_end(next_id): break
         sys.stdout.write(dec(next_id))
         sys.stdout.flush()
       sys.stdout.write(dec()+"\n")
-    finally: gen.close()
     return
 
   # warmup the JIT
@@ -294,8 +281,7 @@ def main():
 
   # do benchmark
   if args.benchmark is not None:
-    gen = model.generate(toks:=[tok.bos_id or 0])
-    try:
+    with closing(model.generate(toks:=[tok.bos_id or 0])) as gen:
       for i in range(args.benchmark):
         profile_marker(f"decode @ {i}")
         GlobalCounters.reset()
@@ -307,7 +293,6 @@ def main():
             with WallTimeEvent(BenchEvent.STEP): next_id = next(gen)
           else: next_id = next(gen)
         if args.placement is not None and tok.is_end(next_id): break
-    finally: gen.close()
     return
 
   # interactive chat
@@ -317,8 +302,7 @@ def main():
     except EOFError: break
     ids = tok.encode(template.render(messages=messages, add_generation_prompt=True))
     reply, dec = "", tok.stream_decoder()
-    gen = model.generate(ids)
-    try:
+    with closing(model.generate(ids)) as gen:
       for next_id in gen:
         if tok.is_end(next_id):
           sys.stdout.write(dec() + "\n\n")
@@ -326,7 +310,6 @@ def main():
         reply += (piece := dec(next_id))
         sys.stdout.write(piece)
         sys.stdout.flush()
-    finally: gen.close()
     messages.append({"role":"assistant", "content":reply})
 
 if __name__ == "__main__": main()

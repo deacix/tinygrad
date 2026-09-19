@@ -2,6 +2,7 @@
 from __future__ import annotations
 import re
 from dataclasses import dataclass
+from itertools import accumulate
 from typing import Literal, TYPE_CHECKING
 if TYPE_CHECKING:
   from tinygrad.llm.gguf import GGUFIndex, GGUFTensorInfo
@@ -25,8 +26,7 @@ class LayerPlacement:
     for device in self.devices:
       if not isinstance(device, str) or (match := re.fullmatch(r'(CPU|PYTHON|AMD|NV|CUDA)(?::([0-9]+))?', device.upper())) is None:
         raise ValueError(f'unsupported placement device: {device!r}')
-      index = int(match[2] or '0')
-      devices.append(match[1] + (f':{index}' if index else ''))
+      devices.append(match[1] + (f':{index}' if (index := int(match[2] or '0')) else ''))
     if len(set(devices)) != len(devices): raise ValueError('placement devices must be distinct')
     if len({d.split(':')[0] for d in devices}) != 1: raise ValueError('placement requires one backend')
     if self.transfer not in ('host', 'native'): raise ValueError('transfer must be host or native')
@@ -35,9 +35,7 @@ class LayerPlacement:
 
   def block_device(self, index:int) -> str:
     if type(index) is not int or not 0 <= index < sum(self.layer_counts): raise ValueError(f'invalid block index: {index!r}')
-    end = 0
-    for device, count in zip(self.devices, self.layer_counts):
-      end += count
+    for device, end in zip(self.devices, accumulate(self.layer_counts)):
       if index < end: return device
     raise ValueError('invalid placement coverage')
 

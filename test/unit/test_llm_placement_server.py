@@ -50,6 +50,24 @@ def run_cli(argv, model, *, tok=None):
 
 
 class TestPlacementCLI:
+  @pytest.mark.parametrize('preset,prefix,suffix', [
+    ('olmo','<|user|>\n','\n'), ('kimi-k2','<|im_user|>user<|im_middle|>','<eos>'),
+    ('qwen2','<|im_start|>user\n','<eos>\n'), ('glm4','<|user|>',''), ('tekken','[INST]','[/INST]'),
+    ('llama3','<|start_header_id|>user<|end_header_id|>\n\n','<eos>'),
+  ])
+  def test_fallback_template_preserves_legacy_formats(self,preset,prefix,suffix):
+    tok = SimpleNamespace(preset=preset, eos_id=9, bos_id=None, decode=lambda ids: '<eos>' if ids else '')
+    template = cli.FallbackTemplate(tok)
+    assert template.role('user') == prefix
+    assert template.end_turn() == suffix
+    assert template.render([{'role':'user','content':'{content}'}], add_generation_prompt=False) == \
+      ('<sop>' if preset == 'glm4' else '') + prefix + '{content}' + suffix
+    if preset == 'tekken':
+      assert template.role('assistant') == ''
+      with pytest.raises(ValueError, match='Unsupported role'): template.role('system')
+    else:
+      assert template.role('{literal}') == prefix.replace('user', '{literal}')
+
   def test_defaults_and_legacy_options(self):
     args = cli.parse_args([])
     assert args.model == next(iter(cli.models))

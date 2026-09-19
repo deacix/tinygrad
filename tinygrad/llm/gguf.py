@@ -3,7 +3,7 @@ from dataclasses import dataclass, replace
 from typing import Any, BinaryIO, Callable
 
 from tinygrad.tensor import Tensor
-from tinygrad.dtype import dtypes
+from tinygrad.dtype import DType, dtypes
 from tinygrad.helpers import prod, round_up
 from tinygrad.nn.state import TensorIO
 
@@ -242,16 +242,26 @@ def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
   return kv, sd
 
 # Checked, read-only path API. Deliberately separate from the legacy Tensor/DISK parser above.
-# Shape is in tinygrad order; offset is absolute, excluding alignment padding.
 @dataclass(frozen=True)
-class GGUFTensorInfo: name: str; part: int; shape: tuple[int, ...]; ggml_type: int; offset: int; nbytes: int  # noqa: E702
+class GGUFTensorInfo:
+  name: str
+  part: int
+  shape: tuple[int, ...]  # tinygrad order
+  ggml_type: int
+  offset: int  # absolute file offset, excluding alignment padding
+  nbytes: int
 
-# Identity: device, inode, size, mtime_ns.
 @dataclass(frozen=True)
-class GGUFPart: path: pathlib.Path; size: int; identity: tuple[int, int, int, int]  # noqa: E702
+class GGUFPart:
+  path: pathlib.Path
+  size: int
+  identity: tuple[int, int, int, int]  # device, inode, size, mtime_ns
 
 @dataclass(frozen=True)
-class GGUFIndex: kv: dict; parts: tuple[GGUFPart, ...]; tensors: tuple[GGUFTensorInfo, ...]  # noqa: E702
+class GGUFIndex:
+  kv: dict
+  parts: tuple[GGUFPart, ...]
+  tensors: tuple[GGUFTensorInfo, ...]
 
 # New-path implementation limits, not limits on the GGUF format or expanded Python object memory.
 _GGUF_MAX_METADATA, _GGUF_MAX_TENSORS, _GGUF_MAX_KEYS, _GGUF_MAX_ARRAY = 256 << 20, 1_000_000, 1_000_000, 10_000_000
@@ -371,6 +381,15 @@ def index_gguf(path: str | pathlib.Path) -> GGUFIndex:
   if any(total != len(descriptors) for total in totals): raise ValueError('GGUF aggregate tensor count mismatch')
   return GGUFIndex(kv, tuple(parts.values()), tuple(descriptors.values()))
 
+def _upload_placed_input(data:list|bytes, dtype:DType, destination:str) -> Tensor:
+  # Hold the actual _frompy allocation, not just its Python values, until asynchronous copies finish.
+  from tinygrad.device import Device
+  source = Tensor(data, dtype=dtype, device='PYTHON').realize()
+  out = source.to(destination).realize()
+  Device[destination].synchronize()
+  return out
+
+
 def load_gguf_tensor(index: GGUFIndex, info: GGUFTensorInfo, *, device: str) -> Tensor:
   """Read one exact packed payload onto an explicit owner, then decode lazily on that owner.
 
@@ -393,9 +412,6 @@ def load_gguf_tensor(index: GGUFIndex, info: GGUFTensorInfo, *, device: str) -> 
     payload = f.read(info.nbytes)
     if _gguf_identity(f) != part.identity: raise ValueError('GGUF file changed while reading payload')
     if len(payload) != info.nbytes: raise ValueError('Truncated GGUF tensor payload')
-  source = Tensor(payload, dtype=dtypes.uint8, device='PYTHON').realize()
-  raw = source.to(device).realize()
-  from tinygrad.device import Device
-  Device[device].synchronize()  # source's separate _frompy allocation must stay alive through asynchronous copy completion
-  del source, payload
+  raw = _upload_placed_input(payload, dtypes.uint8, device)
+  del payload
   return ggml_data_to_tensor(raw, prod(info.shape), info.ggml_type).reshape(info.shape)
