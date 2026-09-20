@@ -1,10 +1,14 @@
 from __future__ import annotations
 import sys, argparse, codecs, itertools, typing, re, unicodedata, json, time
 from typing import TYPE_CHECKING
+from contextlib import closing
+from pathlib import Path
 from tinygrad import nn
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, Context, fetch, profile_marker, getenv
-from tinygrad.llm.model import Transformer
+from tinygrad.llm.model import Transformer, preflight_placement
+from tinygrad.llm.gguf import index_gguf
+from tinygrad.llm.placement import LayerPlacement, PlacementMemory, estimate_placement
 if TYPE_CHECKING:
   import jinja2
 
@@ -40,8 +44,7 @@ class SimpleTokenizer:
     self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
     self._special_tokens = special_tokens
     self._tok2bytes = {tid: tok for tok, tid in self._normal_tokens.items()} | {tid: tok.encode() for tok, tid in self._special_tokens.items()}
-    self.preset = preset
-    self.bos_id, self.eos_id, self.eot_id = bos_id, eos_id, eot_id
+    self.preset, self.bos_id, self.eos_id, self.eot_id = preset, bos_id, eos_id, eot_id
 
   @staticmethod
   def from_gguf_kv(kv:dict):
@@ -106,22 +109,13 @@ class FallbackTemplate:
   # minimal jinja2.Template-compatible chat template without jinja2, no tool calling support
   def __init__(self, tok:SimpleTokenizer): self.tok = tok
   def role(self, role:str) -> str:
-    if self.tok.preset == 'olmo': return "<|" + role + "|>\n"  # OLMoE Instruct format
-    if self.tok.preset == 'kimi-k2': return "<|im_" + role + "|>" + role + "<|im_middle|>"
-    if self.tok.preset == 'qwen2': return "<|im_start|>" + role + "\n"
-    if self.tok.preset == 'glm4': return "<|" + role + "|>"
-    if self.tok.preset == 'tekken':
-      if role == 'user': return "[INST]"
-      if role == 'assistant': return ""
-      raise ValueError(f"Unsupported role '{role}' for tokenizer preset '{self.tok.preset}'")
-    return "<|start_header_id|>" + role + "<|end_header_id|>\n\n"
+    formats = {'olmo':"<|{0}|>\n", 'kimi-k2':"<|im_{0}|>{0}<|im_middle|>", 'qwen2':"<|im_start|>{0}\n", 'glm4':"<|{0}|>"}
+    if self.tok.preset != 'tekken': return formats.get(self.tok.preset, "<|start_header_id|>{0}<|end_header_id|>\n\n").format(role)
+    if role in ('user', 'assistant'): return "[INST]" if role == 'user' else ""
+    raise ValueError(f"Unsupported role '{role}' for tokenizer preset '{self.tok.preset}'")
   def end_turn(self) -> str:
-    if self.tok.preset == 'olmo': return "\n"
-    if self.tok.preset == 'kimi-k2': return self.tok.decode([self.tok.eos_id])
-    if self.tok.preset == 'qwen2': return self.tok.decode([self.tok.eos_id]) + "\n"
-    if self.tok.preset == 'glm4': return ""
-    if self.tok.preset == 'tekken': return "[/INST]"
-    return self.tok.decode([self.tok.eos_id])
+    if self.tok.preset in (fixed := {'olmo':"\n", 'glm4':"", 'tekken':"[/INST]"}): return fixed[self.tok.preset]
+    return self.tok.decode([self.tok.eos_id]) + ("\n" if self.tok.preset == 'qwen2' else "")
   def render(self, messages:list[dict], tools=None, add_generation_prompt:bool=True, preserve_thinking:bool=False) -> str:
     out = self.tok.decode([] if self.tok.bos_id is None else [self.tok.bos_id]) + ("<sop>" if self.tok.preset == 'glm4' else "")
     for msg in messages:
@@ -140,7 +134,7 @@ from tinygrad.llm.serve import LLMServer
 
 def parse_args(argv:list[str]|None=None):
   parser = argparse.ArgumentParser()
-  parser.add_argument("--model", "-m", default=list(models.keys())[0], help=f"Model choice ({', '.join(models.keys())}) or path to a local GGUF file")
+  parser.add_argument("--model", "-m", help=f"Model choice ({', '.join(models.keys())}) or path to a local GGUF file")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
@@ -153,9 +147,31 @@ def parse_args(argv:list[str]|None=None):
   parser.add_argument("--image-max-pixels", type=int, default=262144)
   parser.add_argument("--max-images", type=int, default=4)
   parser.add_argument("--max-visual-tokens", type=int, default=1024)
+  parser.add_argument("--devices", help="Experimental placement: comma-separated ordered devices (requires local --model and --layer-counts)")
+  parser.add_argument("--layer-counts", help="Comma-separated positive block counts, one per placement device")
+  parser.add_argument("--transfer", choices=("host", "native"), help="Placement transfer policy (default host; native is not a P2P guarantee)")
+  parser.add_argument("--chunk-size", type=int, help="Fixed placement prefill chunk, 1-32 (default 32)")
+  parser.add_argument("--placement-check", action="store_true", default=None,
+                      help="Check local GGUF ownership/bytes without loading or opening devices")
   args = parser.parse_args(argv)
   if args.max_context <= 0 or (args.max_output_tokens is not None and args.max_output_tokens <= 0):
     parser.error("context and output limits must be positive")
+  args.placement = None
+  if any(v is not None for v in (args.devices, args.layer_counts, args.transfer, args.chunk_size, args.placement_check)):
+    # Reject mixed modes and malformed fixed configuration before even probing local files.
+    if args.vision_dir is not None or args.image or args.prompt is not None:
+      parser.error("placement does not support --vision-dir, --image or --prompt")
+    if args.devices is None or args.layer_counts is None: parser.error("placement requires both --devices and --layer-counts")
+    try:
+      counts = tuple(int(n) for n in args.layer_counts.split(','))
+      args.placement = LayerPlacement(tuple(d.strip() for d in args.devices.split(',')), counts,
+                                      args.transfer if args.transfer is not None else 'host',
+                                      args.chunk_size if args.chunk_size is not None else 32).validate(sum(counts))
+      if args.placement.chunk_size > args.max_context: raise ValueError("chunk size must fit context")
+    except ValueError as exc: parser.error(str(exc))
+    if args.model is None or args.model in models or '://' in args.model or not Path(args.model).is_file():
+      parser.error("placement requires an explicit existing local --model file, not an alias or URL")
+  if args.model is None: args.model = next(iter(models))
   if bool(args.image) != (args.prompt is not None): parser.error("--image and --prompt must be supplied together")
   if args.image and (args.serve is not None or args.benchmark is not None): parser.error("one-shot images conflict with serving/benchmark")
   if args.image and not args.vision_dir: parser.error("--image requires --vision-dir")
@@ -170,28 +186,50 @@ def parse_args(argv:list[str]|None=None):
     parser.error("--max-output-tokens requires --serve or --vision-dir")
   return args
 
+def report_placement(placement:LayerPlacement, memory:tuple[PlacementMemory, ...], context:int, vocab_size:int):
+  print(f"experimental layer placement: CPU-validated software only; fit unknown; max context {context}, "
+        f"chunk {placement.chunk_size}, transfer {placement.transfer}")
+  for start, count, m in zip(itertools.accumulate(placement.layer_counts, initial=0), placement.layer_counts, memory):
+    print(f"{m.device} blocks=[{start},{start+count}) raw_weight_bytes={m.weight_bytes} tied_replica_bytes={m.tied_replica_bytes} "
+          f"kv_bytes={m.kv_bytes} rope_bytes={m.rope_bytes} boundary_bytes={m.boundary_bytes} largest_payload_bytes={m.largest_payload_bytes}")
+  print(f"embedding owner={placement.devices[0]}; output norm/projection owner={placement.devices[-1]}; "
+        f"logits_bytes={vocab_size*4} owner={placement.devices[-1]} (provision)")
+  print("tied_replica_bytes is a subset of raw_weight_bytes, not an additional charge; boundaries provision two FP32 chunk buffers per stage.")
+  print("scratch, decoded temporaries, JIT, allocator rounding and backend staging are unknown; no physical memory fit or performance guarantee.")
+  print("active loading may hold two largest payload copies plus staging; retained PYTHON/backend allocator caches leave process RAM unbounded.")
+  print("Use only trusted local files and private/trusted serving deployments (or a secured gateway).")
+
+
 def main():
   args = parse_args()
-  # load the model
-  model_path = fetch(models.get(args.model, args.model))
+  # Explicit placement never resolves aliases/URLs or calls fetch, even for local files.
+  model_path = Path(args.model) if args.placement is not None else fetch(models.get(args.model, args.model))
+  if args.placement is not None:
+    config, args.placement = preflight_placement(index := index_gguf(model_path), args.placement,
+                                                max_context=args.max_context, realize=bool(getenv('REALIZE', 0)))
+    report_placement(args.placement, estimate_placement(index, config, args.placement), config.max_context, config.vocab_size)
+    del index  # Keep no source manifest or registered cache/JIT state in reports.
+    if args.placement_check: return
   vision = image_limits = None
   if args.vision_dir:
-    from pathlib import Path
     from tinygrad.llm.vision import validate_vision_bundle, validate_vision_metadata, load_vision
     from tinygrad.llm.multimodal import ImageLimits
     verified = validate_vision_bundle(Path(args.vision_dir), model_path)
     image_limits = ImageLimits(max_pixels=args.image_max_pixels, max_images=args.max_images, max_visual_tokens=args.max_visual_tokens)
   with Context(DEBUG=max(DEBUG.value, 2 if args.serve else 0)):
-    model, kv = Transformer.from_gguf(model_path, args.max_context)
+    model, kv = Transformer.from_gguf(model_path, args.max_context, placement=args.placement) if args.placement is not None else \
+                Transformer.from_gguf(model_path, args.max_context)
   if args.vision_dir:
     validate_vision_metadata(kv)
     vision_device = model.token_embd.weight.device
     if not isinstance(vision_device, str): raise ValueError("vision requires a single decoder device")
     vision = load_vision(Path(args.vision_dir), device=vision_device)
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
-  file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
-  print(f"using model \"{model_name}\" with {sum(file_sizes):,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params, "
-        f"max context {args.max_context} on {nn.state.get_parameters(model)[0].device}")
+  if args.placement is not None: print(f'using model "{model_name}" (raw weights and state provisions reported above)')
+  else:
+    file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
+    print(f"using model \"{model_name}\" with {sum(file_sizes):,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params, "
+          f"max context {args.max_context} on {nn.state.get_parameters(model)[0].device}")
 
   # get tokenizer
   tok = SimpleTokenizer.from_gguf_kv(kv)
@@ -222,15 +260,14 @@ def main():
     prompt = prepare_prompt([{"role":"user", "content":content}], tok, template, limits=image_limits,
                             device=vision_device, max_context=model.max_context)
     embeddings = embed_prompt(model, vision, prompt)
-    gen = model.generate(list(prompt.tokens), inputs_embeds=embeddings, position_ids=prompt.position_ids, rope_delta=prompt.rope_delta)
     dec = tok.stream_decoder()
-    try:
+    with closing(model.generate(list(prompt.tokens), inputs_embeds=embeddings,
+                                position_ids=prompt.position_ids, rope_delta=prompt.rope_delta)) as gen:
       for _, next_id in zip(range(min(args.max_output_tokens, model.max_context-len(prompt.tokens))), gen):
         if tok.is_end(next_id): break
         sys.stdout.write(dec(next_id))
         sys.stdout.flush()
       sys.stdout.write(dec()+"\n")
-    finally: gen.close()
     return
 
   # warmup the JIT
@@ -244,18 +281,19 @@ def main():
 
   # do benchmark
   if args.benchmark is not None:
-    gen = model.generate(toks:=[tok.bos_id or 0])
-    for i in range(args.benchmark):
-      profile_marker(f"decode @ {i}")
-      GlobalCounters.reset()
-      if (log:=getenv("BENCHMARK_LOG", "")): from extra.bench_log import WallTimeEvent, BenchEvent
-      with Timing(on_exit=lambda x: f", {1e9/x:6.2f} tok/s, {GlobalCounters.global_mem/x:7.2f} GB/s,"
-                  f" {GlobalCounters.global_mem//1000000}/{GlobalCounters.mem_used//1000000} MB  --  "+\
-                  tok.decode(toks).replace("\n", "\\n")):
-        if log:
-          with WallTimeEvent(BenchEvent.STEP): next(gen)
-        else: next(gen)
-    exit(0)
+    with closing(model.generate(toks:=[tok.bos_id or 0])) as gen:
+      for i in range(args.benchmark):
+        profile_marker(f"decode @ {i}")
+        GlobalCounters.reset()
+        if (log:=getenv("BENCHMARK_LOG", "")): from extra.bench_log import WallTimeEvent, BenchEvent
+        with Timing(on_exit=lambda x: f", {1e9/x:6.2f} tok/s, {GlobalCounters.global_mem/x:7.2f} GB/s,"
+                    f" {GlobalCounters.global_mem//1000000}/{GlobalCounters.mem_used//1000000} MB  --  "+\
+                    tok.decode(toks).replace("\n", "\\n")):
+          if log:
+            with WallTimeEvent(BenchEvent.STEP): next_id = next(gen)
+          else: next_id = next(gen)
+        if args.placement is not None and tok.is_end(next_id): break
+    return
 
   # interactive chat
   messages: list[dict] = []
@@ -264,13 +302,14 @@ def main():
     except EOFError: break
     ids = tok.encode(template.render(messages=messages, add_generation_prompt=True))
     reply, dec = "", tok.stream_decoder()
-    for next_id in model.generate(ids):
-      if tok.is_end(next_id):
-        sys.stdout.write(dec() + "\n\n")
-        break
-      reply += (piece := dec(next_id))
-      sys.stdout.write(piece)
-      sys.stdout.flush()
+    with closing(model.generate(ids)) as gen:
+      for next_id in gen:
+        if tok.is_end(next_id):
+          sys.stdout.write(dec() + "\n\n")
+          break
+        reply += (piece := dec(next_id))
+        sys.stdout.write(piece)
+        sys.stdout.flush()
     messages.append({"role":"assistant", "content":reply})
 
 if __name__ == "__main__": main()

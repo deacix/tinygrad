@@ -225,7 +225,7 @@ jobs:
     - name: Run unit tests
       run: |
         DEV=CPU python test/null/test_device.py TestRunAsModule.test_module_runs
-        DEV=CPU python -m pytest -n=auto test/unit/ --durations=20
+        DEV=CPU python -m pytest -n=auto test/unit/ --ignore test/unit/test_qwen_generation.py --durations=20
     - name: Run GC tests
       run: python test/external/external_uop_gc.py
     - name: External Benchmark Schedule
@@ -253,7 +253,39 @@ jobs:
         deps: testing_unit
         llvm: 'true'
     - name: Test SPEC=2
-      run: SPEC=2 pytest --maxfail=10 -n auto --durations=30 test/unit test/backend test/opt --ignore test/backend/test_custom_kernel.py --ignore test/unit/test_hashing.py --splits 2 --group ${{ matrix.group }}
+      # Without stored timings, interleave test IDs rather than putting all LLM tests in the first contiguous half.
+      # Include completed node IDs to narrow down progress when a timeout interrupts the summary.
+      run: SPEC=2 pytest -v --maxfail=10 -n auto --durations=30 test/unit test/backend test/opt --ignore test/backend/test_custom_kernel.py --ignore test/unit/test_hashing.py --ignore test/unit/test_qwen_generation.py --splits 2 --splitting-algorithm least_duration --group ${{ matrix.group }}
+
+  qwen-generation:
+    # Keep both original environments, but avoid competing graph-rewrite workloads in the same job.
+    # These tests move here from unittest/spec; no cases or watchdogs are removed.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: '3.11'
+            spec: 1
+          - python: '3.14'
+            spec: 2
+    name: Qwen generation (SPEC=${{ matrix.spec }})
+    runs-on: ${{ github.repository == 'tinygrad/tinygrad' && github.event_name == 'pull_request' && github.event.pull_request.author_association == 'COLLABORATOR' && 'namespace-profile-tinygrad' || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v6
+    - name: Setup Environment
+      uses: ./.github/actions/setup-tinygrad
+      with:
+        key: qwen-generation
+        python-version: ${{ matrix.python }}
+        deps: testing_unit
+        llvm: 'true'
+    - name: Test Qwen generation
+      run: SPEC=${{ matrix.spec }} DEV=CPU python -m pytest -v -n 1 test/unit/test_qwen_generation.py --durations=20
+    - name: Run process replay tests
+      if: matrix.spec == 1
+      uses: ./.github/actions/process-replay
 
   fuzzing:
     name: Fuzzing

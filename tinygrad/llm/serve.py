@@ -1,8 +1,10 @@
 from __future__ import annotations
-import copy, json, math, pathlib, re, socket, time, typing, uuid
+import copy, itertools, json, pathlib, re, socket, time, typing, uuid
 from typing import TYPE_CHECKING
 from tinygrad.helpers import DEBUG, colored, stderr_log
 from tinygrad.viz.serve import TCPServerWithReuse, Handler as VizHandler
+from tinygrad.llm.placement import LayerPlacement
+from tinygrad.llm.model import PlacedInferenceError, PlacedModelUnavailableError, PlacedModelBusyError, valid_temperature
 if TYPE_CHECKING:
   from tinygrad.llm.cli import SimpleTokenizer
   from tinygrad.llm.model import Transformer
@@ -35,8 +37,7 @@ def normalize_messages(messages:list[dict]) -> None:
 class StreamRouter:
   # routes streamed output text to (field, text) deltas, keeping tool_call regions in .buf for the final parse
   def __init__(self, reasoning:bool=False):
-    self.buf = ""
-    self.mode = "reasoning" if reasoning else "undecided"  # output inside a think block is sent as reasoning_content
+    self.buf, self.mode = "", "reasoning" if reasoning else "undecided"  # think blocks are sent as reasoning_content
   def split(self, tag:str, final:bool) -> tuple[str, bool]:
     # split buf on the first full tag, holding back a partial tag at the end unless final
     if tag in self.buf:
@@ -60,6 +61,14 @@ class StreamRouter:
     if emit: yield "content", emit
     if found: self.mode, self.buf = "tool", "<tool_call>" + self.buf
 
+def log_placed_failure(exc:PlacedInferenceError):
+  # Use only bounded metadata, never str(exc), its cause, prompts or backend traceback text.
+  stage = str(exc.stage) if type(exc.stage) is int and 0 <= exc.stage < 1000000 else 'unknown'
+  device = exc.device if isinstance(exc.device, str) and re.fullmatch(r'(CPU|PYTHON|AMD|NV|CUDA)(?::[0-9]{1,10})?', exc.device) else 'unknown'
+  operation = exc.operation if exc.operation in ('stage','transfer','sample','input','direct','generation','warmup','reset') else 'unknown'
+  stderr_log(f'placed inference failure: stage={stage} device={device} operation={operation} exception=PlacedInferenceError; reload required\n')
+
+
 class Handler(VizHandler):
   server: LLMServer
   def log_request(self, code='-', size='-'): pass
@@ -74,15 +83,14 @@ class Handler(VizHandler):
     if not isinstance(ids, list):
       from tinygrad.llm.multimodal import PreparedPrompt, embed_prompt
       if not isinstance(ids, PreparedPrompt): raise ValueError("invalid prepared prompt")
-      prompt = ids
-      reasoning = prompt.starts_reasoning
+      prompt, reasoning = ids, ids.starts_reasoning
       if prompt.pixel_values is not None:
         if embeddings is None: embeddings = embed_prompt(model, self.server.vision, prompt)
         generation_kwargs = {"inputs_embeds":embeddings, "position_ids":prompt.position_ids, "rope_delta":prompt.rope_delta}
       ids = list(prompt.tokens)
-    prompt_tokens = len(ids)
-    remaining = model.max_context-prompt_tokens
+    prompt_tokens, remaining = len(ids), model.max_context-len(ids)
     if generation_kwargs: max_tokens = min(max_tokens or self.server.max_output_tokens or 256, remaining)
+    elif isinstance(getattr(model, 'placement', None), LayerPlacement): max_tokens = min(max_tokens or remaining, remaining)
     cache_start_pos = 0 if generation_kwargs else model.get_start_pos(ids)
     stderr_log(f"in:{colored(f'{cache_start_pos:5d}', 'green')} +{len(ids)-cache_start_pos:5d}  {colored('--', 'BLACK')}  ")
     tmpl = {"id":f"chatcmpl-{uuid.uuid4().hex[:24]}", "object":"chat.completion.chunk", "created":int(time.time()), "model":model_name}
@@ -90,15 +98,12 @@ class Handler(VizHandler):
     out: list[int] = []
     finish_reason = "stop"
     st = pt = time.perf_counter()
-    dec = tok.stream_decoder()
-    router = StreamRouter(reasoning)
+    dec, router = tok.stream_decoder(), StreamRouter(reasoning)
     def log_stats(interrupted:bool=False):
-      et = time.perf_counter()
-      total = f"total:{et-st:6.2f}s"
+      total = f"total:{(et := time.perf_counter())-st:6.2f}s"
       stderr_log(f"gen:{len(out)/(et-pt) if len(out) > 1 else 0:4.0f} tok/s  {colored('--', 'BLACK')}  "
                  f"out:{len(out):5d}  {colored('--', 'BLACK')}  {colored(total, 'red') if interrupted else total}\n")
-    completed = False
-    gen = model.generate(ids, temperature=temperature, **generation_kwargs)
+    completed, gen = False, model.generate(ids, temperature=temperature, **generation_kwargs)
     try:
       yield chunk({"role":"assistant", "content":""})
       for next_id in gen:
@@ -145,17 +150,14 @@ class Handler(VizHandler):
     lengths = self.headers.get_all("Content-Length", [])
     if self.headers.get("Transfer-Encoding") or len(lengths) != 1 or not re.fullmatch(r"[0-9]+", lengths[0]):
       raise ImageInputError("a single Content-Length without Transfer-Encoding is required")
-    length = int(lengths[0])
-    if length > cap: raise ImageInputError("request byte budget exceeded", 413)
+    if (length := int(lengths[0])) > cap: raise ImageInputError("request byte budget exceeded", 413)
     previous = self.connection.gettimeout()
     try:
       deadline, remaining, chunks = time.monotonic()+10, length, []
       while remaining:
-        timeout = deadline-time.monotonic()
-        if timeout <= 0: raise ImageInputError("request body deadline exceeded")
+        if (timeout := deadline-time.monotonic()) <= 0: raise ImageInputError("request body deadline exceeded")
         self.connection.settimeout(timeout)
-        chunk = self.rfile.read1(min(65536, remaining))
-        if not chunk: raise ImageInputError("truncated request body")
+        if not (chunk := self.rfile.read1(min(65536, remaining))): raise ImageInputError("truncated request body")
         chunks.append(chunk)
         remaining -= len(chunk)
       body = json.loads(b"".join(chunks))
@@ -188,10 +190,7 @@ class Handler(VizHandler):
                                                                 for tc in calls)): raise ImageInputError("invalid tool calls")
     for key in ("max_completion_tokens", "max_tokens"):
       if key in body and body[key] is not None and (type(body[key]) is not int or body[key] <= 0): raise ImageInputError(f"{key} must be positive")
-    temperature = body.get("temperature", 0.0)
-    try: valid_temperature = type(temperature) in (int,float) and math.isfinite(temperature) and temperature >= 0
-    except OverflowError: valid_temperature = False
-    if not valid_temperature: raise ImageInputError("invalid temperature")
+    if not valid_temperature(body.get("temperature", 0.0)): raise ImageInputError("invalid temperature")
     if body.get("stream") is None: body["stream"] = False
     if type(body["stream"]) is not bool: raise ImageInputError("stream must be boolean")
     if body.get("stream_options") is None: body["stream_options"] = {}
@@ -200,15 +199,16 @@ class Handler(VizHandler):
     if body.get("tools") is not None and not isinstance(body["tools"], list): raise ImageInputError("tools must be an array")
     return body
 
+  def send_api_error(self, message:str, status:int, error_type:str="server_error", **details):
+    return self.send_data(json.dumps({"error":{"message":message, "type":error_type, **details}}).encode(), status_code=status)
+
   def do_POST(self):
     request_st = time.perf_counter()
     stderr_log(f"{self.path}  {colored('--', 'BLACK')}  ")
     from tinygrad.llm.multimodal import ImageInputError, prepare_prompt
-    if self.path != "/v1/chat/completions":
-      return self.send_data(json.dumps({"error":{"message":"unknown endpoint", "type":"invalid_request_error"}}).encode(), status_code=404)
+    if self.path != "/v1/chat/completions": return self.send_api_error("unknown endpoint", 404, "invalid_request_error")
     try:
-      body = self.read_chat_request()
-      prepared = None
+      body, prepared = self.read_chat_request(), None
       if self.server.vision is not None:
         options = dict(body.get("chat_template_kwargs", {}))
         if "reasoning_effort" in body: options["reasoning_effort"] = body["reasoning_effort"]
@@ -216,33 +216,34 @@ class Handler(VizHandler):
         if not isinstance(device, str): raise ImageInputError("vision requires a single decoder device")
         prepared = prepare_prompt(body["messages"], self.server.tok, self.server.template, limits=self.server.image_limits,
                                   device=device, tools=body.get("tools"), template_kwargs=options, max_context=self.server.model.max_context)
-        ids = list(prepared.tokens)
-        starts_reasoning = prepared.starts_reasoning
+        ids, starts_reasoning = list(prepared.tokens), prepared.starts_reasoning
       else:
         messages = copy.deepcopy(body["messages"])
         normalize_messages(messages)
         rendered = self.server.template.render(messages=messages, tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True)
-        ids = self.server.tok.encode(rendered)
-        starts_reasoning = rendered.rstrip().endswith("<think>")
+        ids, starts_reasoning = self.server.tok.encode(rendered), rendered.rstrip().endswith("<think>")
     except (ImageInputError, ValueError, TypeError, KeyError, RecursionError) as exc:
       status = exc.status if isinstance(exc, ImageInputError) else 400
-      return self.send_data(json.dumps({"error":{"message":str(exc), "type":"invalid_request_error", "param":"messages"}}).encode(),
-                            status_code=status)
+      return self.send_api_error(str(exc), status, "invalid_request_error", param="messages")
     if DEBUG >= 1: print(f"prepared {len(ids)} tokens")
     if self.path == "/v1/chat/completions":
       stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  ")
       if len(ids) >= self.server.model.max_context:
         stderr_log(f"{colored('context length exceeded', 'red')}  in:{len(ids):5d}  max:{self.server.model.max_context:5d}\n")
-        return self.send_data(json.dumps({"error":{"message":f"prompt has {len(ids)} tokens, but the model context is "
-          f"{self.server.model.max_context}", "type":"invalid_request_error", "param":"messages", "code":"context_length_exceeded"}}).encode(),
-          status_code=400)
+        return self.send_api_error(f"prompt has {len(ids)} tokens, but the model context is {self.server.model.max_context}",
+                                   400, "invalid_request_error", param="messages", code="context_length_exceeded")
 
       embeddings = None
       if prepared is not None and prepared.pixel_values is not None:
         from tinygrad.llm.multimodal import embed_prompt
         try: embeddings = embed_prompt(self.server.model, self.server.vision, prepared)
-        except Exception:
-          return self.send_data(json.dumps({"error":{"message":"vision inference failed", "type":"server_error"}}).encode(), status_code=500)
+        except Exception: return self.send_api_error("vision inference failed", 500)
+      # Check synchronously; run_model first yields a role chunk without acquiring ownership. Mocks are not placement.
+      placed = isinstance(getattr(self.server.model, 'placement', None), LayerPlacement)
+      if placed:
+        try: self.server.model.check_available()
+        except PlacedModelUnavailableError: return self.send_api_error("placed model unavailable; reload required", 503)
+        except PlacedModelBusyError: return self.send_api_error("placed model is in use", 409)
       # reply
       max_tokens = body.get("max_completion_tokens")
       if max_tokens is None: max_tokens = body.get("max_tokens")
@@ -252,37 +253,57 @@ class Handler(VizHandler):
                               not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
                               max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
                               reasoning=starts_reasoning, embeddings=embeddings)
-      if body.get("stream"):
-        def guarded_stream():
-          try: yield from chunks
-          except Exception: yield {"error":{"message":"generation failed", "type":"server_error"}}
-          finally: chunks.close()
-        self.stream_json(guarded_stream())
-      else:
-        try: results = list(chunks)
-        except Exception:
-          return self.send_data(json.dumps({"error":{"message":"generation failed", "type":"server_error"}}).encode(), status_code=500)
-        finally: chunks.close()
-        out, reasoning, tool_calls, finish_reason = [], [], [], "stop"
-        for c in results:
-          if not c["choices"]: continue
-          choice = c["choices"][0]
-          if (delta := choice.get("delta", {})):
-            if delta.get("content"): out.append(delta["content"])
-            if delta.get("reasoning_content"): reasoning.append(delta["reasoning_content"])
-            tool_calls += [{k:v for k, v in tc.items() if k != "index"} for tc in delta.get("tool_calls", [])]
-          if choice.get("finish_reason"): finish_reason = choice["finish_reason"]
-        message: dict[str, typing.Any] = {"role":"assistant", "content":"".join(out) or None}
-        if reasoning: message["reasoning_content"] = "".join(reasoning)
-        if tool_calls: message["tool_calls"] = tool_calls
-        self.send_data(json.dumps({**c, "object":"chat.completion",
-          "choices":[{"index":0, "message":message, "finish_reason":finish_reason}]}).encode())
+      streaming = False
+      try:
+        if body.get("stream"):
+          # Advance past the role before headers, acquiring ownership despite races with the availability snapshot.
+          prefix = (next(chunks), next(chunks)) if placed else ()
+          def guarded_stream():
+            try: yield from itertools.chain(prefix, chunks)
+            except Exception:
+              if placed: raise  # Placed failures must abort without a success finish/[DONE].
+              yield {"error":{"message":"generation failed", "type":"server_error"}}
+            finally: chunks.close()
+          streaming = True
+          self.stream_json(guarded_stream())
+          return
+        results = list(chunks)
+      except (PlacedModelUnavailableError, PlacedModelBusyError) as exc:
+        if not placed or streaming: raise
+        chunks.close()
+        return self.send_api_error("placed model unavailable or busy", 503 if isinstance(exc, PlacedModelUnavailableError) else 409)
+      except PlacedInferenceError as exc:
+        if placed: log_placed_failure(exc)
+        if streaming:
+          self.close_connection = True
+          return
+        chunks.close()
+        return self.send_api_error("generation failed", 500)
+      except Exception:
+        if placed or streaming: raise  # Do not misclassify programmer/protocol errors as placed inference failures.
+        return self.send_api_error("generation failed", 500)
+      finally: chunks.close()
+      out, reasoning, tool_calls, finish_reason = [], [], [], "stop"
+      for c in results:
+        if not c["choices"]: continue
+        choice = c["choices"][0]
+        if (delta := choice.get("delta", {})):
+          if delta.get("content"): out.append(delta["content"])
+          if delta.get("reasoning_content"): reasoning.append(delta["reasoning_content"])
+          tool_calls += [{k:v for k, v in tc.items() if k != "index"} for tc in delta.get("tool_calls", [])]
+        if choice.get("finish_reason"): finish_reason = choice["finish_reason"]
+      message: dict[str, typing.Any] = {"role":"assistant", "content":"".join(out) or None}
+      if reasoning: message["reasoning_content"] = "".join(reasoning)
+      if tool_calls: message["tool_calls"] = tool_calls
+      self.send_data(json.dumps({**c, "object":"chat.completion",
+        "choices":[{"index":0, "message":message, "finish_reason":finish_reason}]}).encode())
     else:
       raise RuntimeError(f"unhandled path {self.path}")
 
 class LLMServer(TCPServerWithReuse):
   def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any,
                *, vision=None, image_limits=None, max_output_tokens:int|None=None):
+    if isinstance(getattr(model, 'placement', None), LayerPlacement) and vision is not None: raise ValueError("placement does not support vision")
     if max_output_tokens is not None and (type(max_output_tokens) is not int or max_output_tokens <= 0):
       raise ValueError("max_output_tokens must be positive")
     self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
