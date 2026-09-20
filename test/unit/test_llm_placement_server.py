@@ -7,7 +7,7 @@ import pytest
 from tinygrad.llm import cli
 from tinygrad.llm.placement import LayerPlacement
 from test.unit.test_llm_placement import save_llama
-from test.unit.test_llm_placement_execution import load_pair, ref_step
+from test.unit.test_llm_placement_execution import load_pair, load_placed, ref_step
 from tinygrad.llm import model as mm
 from tinygrad.llm.model import PlacedInferenceError, PlacedModelUnavailableError, PlacedModelBusyError
 from tinygrad.llm.serve import LLMServer, Handler
@@ -475,7 +475,10 @@ class TestPlacementHTTPRealCPU:
   @pytest.mark.parametrize('stream', [False,True])
   @pytest.mark.parametrize('cap', [None,3])
   def test_context_exhaustion_reports_length(self,tmp_path,stream,cap):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
+    # Match CLI serving: compilation is startup work, not part of this protocol test's socket deadline.
+    model.warmup()
+    assert model._cached_tokens == []
     with running_server(model) as server:
       server.tok.encode.side_effect = lambda text: [1,2]*15
       status, _, body = request(server,stream=stream,**({'max_tokens':cap} if cap is not None else {}))
@@ -487,9 +490,12 @@ class TestPlacementHTTPRealCPU:
   @pytest.mark.parametrize('stream', [False,True])
   def test_admission_during_direct_input_validation_is_busy(self,tmp_path,stream):
     from tinygrad import Tensor, dtypes
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     tokens = Tensor([[3]],dtype=dtypes.int32,device='CPU').realize()
     temp = Tensor([0.],dtype=dtypes.float32,device='CPU:1').realize()
+    # The race/join budgets measure admission and release, not cold compilation on a loaded CI worker.
+    for _ in range(3): model(tokens,0,temp).realize()
+    assert model._cached_tokens == []
     entered, release = threading.Event(), threading.Event()
     errors, item = [], Tensor.item
     def read(t):
@@ -515,7 +521,7 @@ class TestPlacementHTTPRealCPU:
 
   @pytest.mark.parametrize('stream', [False,True])
   def test_busy_after_availability_snapshot_is_still_preheader(self,tmp_path,stream):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     holder = model.generate([3,1])
     original, admitted = model.check_available, []
     def check():
@@ -532,13 +538,13 @@ class TestPlacementHTTPRealCPU:
     model.check_available()
 
   def test_actual_placement_vision_rejected_before_binding_socket(self,tmp_path):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     with patch.object(socket.socket,'bind',side_effect=AssertionError('socket opened')), pytest.raises(ValueError,match='placement.*vision'):
       LLMServer(('127.0.0.1',0),model,'offline',tokenizer(),Mock(),vision=object())
     model.check_available()
 
   def test_busy_real_generator_returns_409_without_releasing_owner(self,tmp_path):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     gen = model.generate([1,2])
     try:
       next(gen)
@@ -574,7 +580,7 @@ class TestPlacementHTTPRealCPU:
   @pytest.mark.parametrize('stream,fail_at', [(False,1),(True,2)])
   @pytest.mark.parametrize('backend_error', [RuntimeError,BrokenPipeError,ConnectionResetError])
   def test_fault_after_real_kv_mutation_fails_closed(self,tmp_path,stream,fail_at,backend_error):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     transfer = mm._transfer_activation
     calls = []
     def fail(x,destination,mode):
@@ -602,7 +608,7 @@ class TestPlacementHTTPRealCPU:
 
   @pytest.mark.parametrize('error', [BrokenPipeError,ConnectionResetError])
   def test_socket_write_disconnect_does_not_poison_real_model(self,tmp_path,error):
-    model, _ = load_pair(tmp_path)
+    model, _ = load_placed(tmp_path)
     handler = Mock(server=SimpleNamespace(model=model,tok=tokenizer()))
     chunks = Handler.run_model(handler,[1,2],'offline',max_tokens=3)
     writes = []
