@@ -253,7 +253,9 @@ jobs:
         deps: testing_unit
         llvm: 'true'
     - name: Test SPEC=2
-      run: SPEC=2 pytest --maxfail=10 -n auto --durations=30 test/unit test/backend test/opt --ignore test/backend/test_custom_kernel.py --ignore test/unit/test_hashing.py --splits 2 --group ${{ matrix.group }}
+      # Without stored timings, interleave test IDs rather than putting all LLM tests in the first contiguous half.
+      # Include completed node IDs to narrow down progress when a timeout interrupts the summary.
+      run: SPEC=2 pytest -v --maxfail=10 -n auto --durations=30 test/unit test/backend test/opt --ignore test/backend/test_custom_kernel.py --ignore test/unit/test_hashing.py --splits 2 --splitting-algorithm least_duration --group ${{ matrix.group }}
 
   fuzzing:
     name: Fuzzing
