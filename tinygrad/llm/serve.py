@@ -3,6 +3,8 @@ import json, pathlib, re, time, typing, uuid
 from typing import TYPE_CHECKING
 from tinygrad.helpers import DEBUG, colored, stderr_log
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
+from tinygrad.llm.placement import LayerPlacement
+from tinygrad.llm.model import PlacedInferenceError, PlacedModelUnavailableError, PlacedModelBusyError, valid_temperature
 if TYPE_CHECKING:
   from tinygrad.llm.cli import SimpleTokenizer
   from tinygrad.llm.model import Transformer
@@ -60,6 +62,15 @@ class StreamRouter:
     if emit: yield "content", emit
     if found: self.mode, self.buf = "tool", "<tool_call>" + self.buf
 
+def log_placed_failure(exc:PlacedInferenceError):
+  # Use only bounded metadata, never str(exc), its cause, prompts or backend traceback text.
+  stage = str(exc.stage) if type(exc.stage) is int and 0 <= exc.stage < 1000000 else 'unknown'
+  device = exc.device if isinstance(exc.device, str) and re.fullmatch(r'(CPU|PYTHON|AMD|NV|CUDA)(?::[0-9]{1,10})?', exc.device) else 'unknown'
+  operation = exc.operation if exc.operation in ('stage','transfer','sample','input','direct','generation','warmup','reset') else 'unknown'
+  stderr_log(f'placed inference failure: stage={stage} device={device} operation={operation} exception=PlacedInferenceError; reload required\n')
+
+def is_placed(model) -> bool: return isinstance(getattr(model, 'placement', None), LayerPlacement)
+
 class Handler(HTTPRequestHandler):
   server: LLMServer
   def log_request(self, code='-', size='-'): pass
@@ -70,6 +81,10 @@ class Handler(HTTPRequestHandler):
                 reasoning:bool=False):
     model, tok = self.server.model, self.server.tok
     prompt_tokens = len(ids)
+    # A placed generator stops at the context edge; cap there so the reply reports length, not stop.
+    if is_placed(model):
+      remaining = model.max_context-prompt_tokens
+      max_tokens = min(max_tokens or remaining, remaining)
     cache_start_pos = model.get_start_pos(ids)
     stderr_log(f"in:{colored(f'{cache_start_pos:5d}', 'green')} +{len(ids)-cache_start_pos:5d}  {colored('--', 'BLACK')}  ")
     tmpl = {"id":f"chatcmpl-{uuid.uuid4().hex[:24]}", "object":"chat.completion.chunk", "created":int(time.time()), "model":model_name}
@@ -84,10 +99,10 @@ class Handler(HTTPRequestHandler):
       total = f"total:{et-st:6.2f}s"
       stderr_log(f"gen:{len(out)/(et-pt) if len(out) > 1 else 0:4.0f} tok/s  {colored('--', 'BLACK')}  "
                  f"out:{len(out):5d}  {colored('--', 'BLACK')}  {colored(total, 'red') if interrupted else total}\n")
-    completed = False
+    completed, gen = False, model.generate(ids, temperature=temperature)
     try:
       yield chunk({"role":"assistant", "content":""})
-      for next_id in model.generate(ids, temperature=temperature):
+      for next_id in gen:
         if len(out) == 0:
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
         if tok.is_end(next_id): break
@@ -96,6 +111,8 @@ class Handler(HTTPRequestHandler):
         if max_tokens is not None and len(out) >= max_tokens:
           finish_reason = "length"
           break
+      # Close before yielding the final chunk so a retained iterator cannot release a later request's model.
+      if close := getattr(gen, "close", None): close()
       for field, delta in router.route(dec(), final=True): yield chunk({field:delta})
       tool_calls: list[dict] = []
       for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL):
@@ -118,6 +135,52 @@ class Handler(HTTPRequestHandler):
     except GeneratorExit:
       if not completed: log_stats(interrupted=True)
       raise
+    finally:
+      if close := getattr(gen, "close", None): close()
+
+  def send_api_error(self, message:str, status:int, error_type:str="server_error", **details):
+    return self.send_data(json.dumps({"error":{"message":message, "type":error_type, **details}}).encode(), status_code=status)
+
+  def send_completion(self, chunks:typing.Iterable[dict]):
+    out, reasoning, tool_calls, finish_reason = [], [], [], "stop"
+    for c in chunks:
+      if not c["choices"]: continue
+      choice = c["choices"][0]
+      if (delta := choice.get("delta", {})):
+        if delta.get("content"): out.append(delta["content"])
+        if delta.get("reasoning_content"): reasoning.append(delta["reasoning_content"])
+        tool_calls += [{k:v for k, v in tc.items() if k != "index"} for tc in delta.get("tool_calls", [])]
+      if choice.get("finish_reason"): finish_reason = choice["finish_reason"]
+    message: dict[str, typing.Any] = {"role":"assistant", "content":"".join(out) or None}
+    if reasoning: message["reasoning_content"] = "".join(reasoning)
+    if tool_calls: message["tool_calls"] = tool_calls
+    self.send_data(json.dumps({**c, "object":"chat.completion",
+      "choices":[{"index":0, "message":message, "finish_reason":finish_reason}]}).encode())
+
+  def serve_placed(self, chunks:typing.Generator, stream:bool):
+    streaming = False
+    try:
+      if stream:
+        # The second chunk enters generate and takes ownership, so a race after check_available is still a pre-header 409.
+        prefix = (next(chunks), next(chunks))
+        def placed_stream():
+          yield from prefix
+          yield from chunks
+        streaming = True
+        # A placed failure propagates out of stream_json: the reply must end without a success finish or [DONE].
+        return self.stream_json(placed_stream())
+      results = list(chunks)
+    except (PlacedModelUnavailableError, PlacedModelBusyError) as exc:
+      if streaming: raise
+      return self.send_api_error("placed model unavailable or busy", 503 if isinstance(exc, PlacedModelUnavailableError) else 409)
+    except PlacedInferenceError as exc:
+      log_placed_failure(exc)
+      if streaming:
+        self.close_connection = True
+        return
+      return self.send_api_error("generation failed", 500)
+    finally: chunks.close()
+    self.send_completion(results)
 
   def do_POST(self):
     request_st = time.perf_counter()
@@ -139,25 +202,22 @@ class Handler(HTTPRequestHandler):
 
       # reply
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
+      if placed := is_placed(self.server.model):
+        # A placed generator refuses these inside its transaction; answer them as requests, before any header.
+        if not valid_temperature(body.get("temperature", 0.0)):
+          return self.send_api_error("temperature must be finite and nonnegative", 400, "invalid_request_error", param="temperature")
+        if max_tokens is not None and (type(max_tokens) is not int or max_tokens <= 0):
+          return self.send_api_error("max_tokens must be a positive integer", 400, "invalid_request_error", param="max_tokens")
+        # Check synchronously: run_model first yields a role chunk without taking ownership.
+        try: self.server.model.check_available()
+        except PlacedModelUnavailableError: return self.send_api_error("placed model unavailable; reload required", 503)
+        except PlacedModelBusyError: return self.send_api_error("placed model is in use", 409)
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
                               max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
                               reasoning=rendered.rstrip().endswith("<think>"))
+      if placed: return self.serve_placed(chunks, bool(body.get("stream")))
       if body.get("stream"): self.stream_json(chunks)
-      else:
-        out, reasoning, tool_calls, finish_reason = [], [], [], "stop"
-        for c in chunks:
-          if not c["choices"]: continue
-          choice = c["choices"][0]
-          if (delta := choice.get("delta", {})):
-            if delta.get("content"): out.append(delta["content"])
-            if delta.get("reasoning_content"): reasoning.append(delta["reasoning_content"])
-            tool_calls += [{k:v for k, v in tc.items() if k != "index"} for tc in delta.get("tool_calls", [])]
-          if choice.get("finish_reason"): finish_reason = choice["finish_reason"]
-        message: dict[str, typing.Any] = {"role":"assistant", "content":"".join(out) or None}
-        if reasoning: message["reasoning_content"] = "".join(reasoning)
-        if tool_calls: message["tool_calls"] = tool_calls
-        self.send_data(json.dumps({**c, "object":"chat.completion",
-          "choices":[{"index":0, "message":message, "finish_reason":finish_reason}]}).encode())
+      else: self.send_completion(chunks)
     else:
       raise RuntimeError(f"unhandled path {self.path}")
 
