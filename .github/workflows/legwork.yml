@@ -152,21 +152,28 @@ jobs:
             echo "- sha256: \`$sha\` (also in \`SHA256SUMS\`)"
             if [[ $# -gt 0 ]]; then echo "- Served asset: \`$1\` at $2, GitHub digest \`$3\`"; fi
           }
-          for stale in $(gh api "$api" --paginate --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id"); do
-            gh api -X DELETE "$api/$stale"
-          done
+          encode() { python -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$1"; }
+          # The draft by id, never by listing: a draft holds no tag, so a
+          # failed run's draft is harmless and the retry makes its own.
           notes > notes.md
-          gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md "dist/$WHEEL" dist/SHA256SUMS
-          id="$(gh api "$api" --paginate --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id")"
-          [[ "$id" =~ ^[0-9]+$ ]] || { echo "::error::expected one draft for $TAG, found '$id'"; exit 1; }
+          echo "creating the draft $TAG at $GITHUB_SHA"
+          id="$(gh api -X POST "$api" -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" -f name="$TAG" -F draft=true -F body=@notes.md --jq .id)"
+          [[ "$id" =~ ^[0-9]+$ ]] || { echo "::error::the draft for $TAG was not created ('$id')"; exit 1; }
+          for file in "dist/$WHEEL" dist/SHA256SUMS; do
+            echo "uploading $(basename "$file") to draft $id"
+            gh api -X POST -H 'Content-Type: application/octet-stream' --input "$file" --silent \
+              "https://uploads.github.com/$api/$id/assets?name=$(encode "$(basename "$file")")"
+          done
+          echo "reading the draft's assets back"
           read -r served asset digest < <(gh api "$api/$id" --jq '.assets[] | select(.name | endswith(".whl")) | [.name, .id, .digest] | @tsv')
           gh api -H 'Accept: application/octet-stream' "$api/assets/$asset" > uploaded.whl
           [[ "$(sha256sum uploaded.whl | cut -d' ' -f1)" == "$sha" ]] || { echo "::error::the uploaded asset differs from the built wheel"; exit 1; }
           [[ "$digest" == "sha256:$sha" ]] || { echo "::error::GitHub's asset digest '$digest' is not sha256:$sha"; exit 1; }
           verified="the uploaded bytes and GitHub's digest"
           # GitHub serves the asset at its name percent-encoded ("+" is %2B).
-          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$(python -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$served")"
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$(encode "$served")"
           notes "$served" "$url" "$digest" > notes.md
+          echo "publishing draft $id"
           gh api -X PATCH "$api/$id" -F draft=false -F body=@notes.md --silent
           published="$(gh api "$api/tags/$TAG" --jq '.assets[] | select(.name | endswith(".whl")) | .browser_download_url')"
           [[ "$published" == "$url" ]] || { echo "::error::the published asset URL is '$published', expected $url"; exit 1; }
