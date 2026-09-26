@@ -7,9 +7,10 @@
 # Release: LEGWORK_VERSION is the release counter n. After the gate passes on a
 # push to legwork/v0.14.0, the release job publishes v0.14.0-legwork.<n> unless
 # that release already exists, so bumping LEGWORK_VERSION (with the matching
-# pyproject version) is how a new wheel ships. GitHub renames the "+" in the
-# wheel's file name when it serves the asset: the notes and the run summary record
-# the served name and URL beside the canonical file name installers must save it as.
+# pyproject version) is how a new wheel ships. GitHub serves the asset at a URL
+# with the "+" of the wheel's version percent-encoded: the notes and the run
+# summary record the served name and URL beside the canonical file name
+# installers must save it as, since pip and uv read the version from it.
 name: Legwork build
 
 on:
@@ -123,6 +124,26 @@ jobs:
           set -euo pipefail
           api="repos/$GITHUB_REPOSITORY/releases"
           sha="$(cut -d' ' -f1 dist/SHA256SUMS)"
+          url="" verified=""
+          # Written whatever the verdict, so a red run still names how far the release got.
+          summary() {
+            local status=$?
+            {
+              if [[ $status -eq 0 ]]; then echo "### Published $TAG"; else echo "### $TAG not verified (exit $status)"; fi
+              echo
+              echo "The pin (deacix/legwork \`TINYGRAD_FORK_PIN\`), verified: ${verified:-nothing yet}."
+              echo
+              echo "| Field | Value |"
+              echo "|---|---|"
+              echo "| version | \`$VERSION\` |"
+              echo "| tag | \`$TAG\` |"
+              echo "| commit | \`$GITHUB_SHA\` |"
+              echo "| assetUrl | ${url:--} |"
+              echo "| wheelFile | \`$WHEEL\` |"
+              echo "| sha256 | \`$sha\` |"
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+          trap summary EXIT
           notes() {
             echo "The Legwork build of tinygrad: v0.14.0 plus the tinygrad.llm kernels package and layer placement (deacix/legwork ADR-23683)."
             echo
@@ -142,24 +163,13 @@ jobs:
           gh api -H 'Accept: application/octet-stream' "$api/assets/$asset" > uploaded.whl
           [[ "$(sha256sum uploaded.whl | cut -d' ' -f1)" == "$sha" ]] || { echo "::error::the uploaded asset differs from the built wheel"; exit 1; }
           [[ "$digest" == "sha256:$sha" ]] || { echo "::error::GitHub's asset digest '$digest' is not sha256:$sha"; exit 1; }
-          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$served"
+          verified="the uploaded bytes and GitHub's digest"
+          # GitHub serves the asset at its name percent-encoded ("+" is %2B).
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$(python -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$served")"
           notes "$served" "$url" "$digest" > notes.md
           gh api -X PATCH "$api/$id" -F draft=false -F body=@notes.md --silent
           published="$(gh api "$api/tags/$TAG" --jq '.assets[] | select(.name | endswith(".whl")) | .browser_download_url')"
           [[ "$published" == "$url" ]] || { echo "::error::the published asset URL is '$published', expected $url"; exit 1; }
           curl -fsSL --retry 3 -o public.whl "$url"
           [[ "$(sha256sum public.whl | cut -d' ' -f1)" == "$sha" ]] || { echo "::error::the public download differs from the built wheel"; exit 1; }
-          {
-            echo "### Published $TAG"
-            echo
-            echo "The pin (deacix/legwork \`TINYGRAD_FORK_PIN\`):"
-            echo
-            echo "| Field | Value |"
-            echo "|---|---|"
-            echo "| version | \`$VERSION\` |"
-            echo "| tag | \`$TAG\` |"
-            echo "| commit | \`$GITHUB_SHA\` |"
-            echo "| assetUrl | $url |"
-            echo "| wheelFile | \`$WHEEL\` |"
-            echo "| sha256 | \`$sha\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          verified="the uploaded bytes, GitHub's digest and the public download"
