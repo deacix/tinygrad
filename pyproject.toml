@@ -1,6 +1,6 @@
 [project]
 name = "tinygrad"
-version = "0.14.0"
+version = "0.14.0+legwork.1"
 description = "You like pytorch? You like micrograd? You love tinygrad! <3"
 authors = [{ name = "George Hotz" }]
 
