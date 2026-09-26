@@ -48,5 +48,7 @@ jobs:
           python -m pytest -q -n auto
           test/unit/test_gguf.py
           test/unit/test_gguf_placement.py
+          test/unit/test_llm_placement.py
+          test/unit/test_llm_placement_execution.py
           test/unit/test_llm_server.py
           test/null/test_llm_server.py
