@@ -3,6 +3,13 @@
 # tinygrad.llm layer placement. The gate holds the runtime, the engine and
 # tensor.py byte-equal to the tag, so every Legwork launcher seam written against
 # 0.14.0 stays valid, and runs the llm suites on CPU.
+#
+# Release: LEGWORK_VERSION is the release counter n. After the gate passes on a
+# push to legwork/v0.14.0, the release job publishes v0.14.0-legwork.<n> unless
+# that release already exists, so bumping LEGWORK_VERSION (with the matching
+# pyproject version) is how a new wheel ships. GitHub renames the "+" in the
+# wheel's file name when it serves the asset: the notes and the run summary record
+# the served name and URL beside the canonical file name installers must save it as.
 name: Legwork build
 
 on:
@@ -36,6 +43,12 @@ jobs:
           python-version: '3.12'
       - name: Install
         run: pip install -e '.[testing_unit]' pytest-xdist ruff
+      - name: Version is 0.14.0+legwork.<LEGWORK_VERSION>
+        run: |
+          n="$(tr -d '[:space:]' < LEGWORK_VERSION)"
+          [[ "$n" =~ ^[1-9][0-9]*$ ]] || { echo "::error::LEGWORK_VERSION must be a positive integer, read '$n'"; exit 1; }
+          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          [[ "$version" == "0.14.0+legwork.$n" ]] || { echo "::error::pyproject version is $version, LEGWORK_VERSION wants 0.14.0+legwork.$n"; exit 1; }
       - name: Runtime, engine and tensor.py equal v0.14.0
         run: git diff --stat --exit-code v0.14.0 -- tinygrad/runtime tinygrad/engine tinygrad/tensor.py
       - name: Ruff on tinygrad/llm
@@ -54,3 +67,99 @@ jobs:
           test/unit/test_llm_placement_qwen.py
           test/unit/test_llm_server.py
           test/null/test_llm_server.py
+
+  release:
+    name: publish the wheel for a new LEGWORK_VERSION
+    needs: gate
+    if: github.ref == 'refs/heads/legwork/v0.14.0' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Is this version published?
+        id: plan
+        run: |
+          n="$(tr -d '[:space:]' < LEGWORK_VERSION)"
+          tag="v0.14.0-legwork.$n"
+          {
+            echo "version=0.14.0+legwork.$n"
+            echo "tag=$tag"
+            echo "wheel=tinygrad-0.14.0+legwork.$n-py3-none-any.whl"
+          } >> "$GITHUB_OUTPUT"
+          # A published release holds its tag; a draft does not, so a failed run's draft never blocks the retry.
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --silent 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "$tag is already published; nothing to release." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build the wheel and SHA256SUMS
+        if: steps.plan.outputs.exists == 'false'
+        env:
+          WHEEL: ${{ steps.plan.outputs.wheel }}
+        run: |
+          pip install build
+          python -m build --wheel
+          built=(dist/*)
+          [[ ${#built[@]} -eq 1 && "${built[0]}" == "dist/$WHEEL" ]] || { echo "::error::expected only dist/$WHEEL, found: ${built[*]}"; exit 1; }
+          for module in tinygrad/llm/kernels/amd.py tinygrad/llm/placement.py; do
+            unzip -l "dist/$WHEEL" | grep -q " $module\$" || { echo "::error::$WHEEL lacks $module"; exit 1; }
+          done
+          (cd dist && sha256sum "$WHEEL" > SHA256SUMS)
+      - name: Publish after verifying the served bytes
+        if: steps.plan.outputs.exists == 'false'
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          WHEEL: ${{ steps.plan.outputs.wheel }}
+        run: |
+          set -euo pipefail
+          api="repos/$GITHUB_REPOSITORY/releases"
+          sha="$(cut -d' ' -f1 dist/SHA256SUMS)"
+          notes() {
+            echo "The Legwork build of tinygrad: v0.14.0 plus the tinygrad.llm kernels package and layer placement (deacix/legwork ADR-23683)."
+            echo
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- Canonical wheel file: \`$WHEEL\`. Save the download under this name: pip reads the version from it."
+            echo "- sha256: \`$sha\` (also in \`SHA256SUMS\`)"
+            if [[ $# -gt 0 ]]; then echo "- Served asset: \`$1\` at $2, GitHub digest \`$3\`"; fi
+          }
+          for stale in $(gh api "$api" --paginate --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id"); do
+            gh api -X DELETE "$api/$stale"
+          done
+          notes > notes.md
+          gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md "dist/$WHEEL" dist/SHA256SUMS
+          id="$(gh api "$api" --paginate --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id")"
+          [[ "$id" =~ ^[0-9]+$ ]] || { echo "::error::expected one draft for $TAG, found '$id'"; exit 1; }
+          read -r served asset digest < <(gh api "$api/$id" --jq '.assets[] | select(.name | endswith(".whl")) | [.name, .id, .digest] | @tsv')
+          gh api -H 'Accept: application/octet-stream' "$api/assets/$asset" > uploaded.whl
+          [[ "$(sha256sum uploaded.whl | cut -d' ' -f1)" == "$sha" ]] || { echo "::error::the uploaded asset differs from the built wheel"; exit 1; }
+          [[ "$digest" == "sha256:$sha" ]] || { echo "::error::GitHub's asset digest '$digest' is not sha256:$sha"; exit 1; }
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$served"
+          notes "$served" "$url" "$digest" > notes.md
+          gh api -X PATCH "$api/$id" -F draft=false -F body=@notes.md --silent
+          published="$(gh api "$api/tags/$TAG" --jq '.assets[] | select(.name | endswith(".whl")) | .browser_download_url')"
+          [[ "$published" == "$url" ]] || { echo "::error::the published asset URL is '$published', expected $url"; exit 1; }
+          curl -fsSL --retry 3 -o public.whl "$url"
+          [[ "$(sha256sum public.whl | cut -d' ' -f1)" == "$sha" ]] || { echo "::error::the public download differs from the built wheel"; exit 1; }
+          {
+            echo "### Published $TAG"
+            echo
+            echo "The pin (deacix/legwork \`TINYGRAD_FORK_PIN\`):"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| version | \`$VERSION\` |"
+            echo "| tag | \`$TAG\` |"
+            echo "| commit | \`$GITHUB_SHA\` |"
+            echo "| assetUrl | $url |"
+            echo "| wheelFile | \`$WHEEL\` |"
+            echo "| sha256 | \`$sha\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
