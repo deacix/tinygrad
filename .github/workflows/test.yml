@@ -238,7 +238,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [1, 2]
+        # Three groups on the Legwork branch: its placement suites pushed two past 15 minutes.
+        group: [1, 2, 3]
     name: SPEC=2 (${{ matrix.group }})
     runs-on: ${{ github.repository == 'tinygrad/tinygrad' && github.event_name == 'pull_request' && github.event.pull_request.author_association == 'COLLABORATOR' && 'namespace-profile-tinygrad' || 'ubuntu-24.04' }}
     timeout-minutes: 15
@@ -252,7 +253,7 @@ jobs:
         deps: testing_unit
         llvm: 'true'
     - name: Test SPEC=2
-      run: SPEC=2 pytest --maxfail=10 -n auto --durations=30 test/unit test/backend test/opt --ignore test/backend/test_custom_kernel.py --ignore test/unit/test_hashing.py -k "not test_setitem_big" -k "not test_conv2d_ceildiv_edge_case" --splits 2 --group ${{ matrix.group }}
+      run: SPEC=2 pytest --maxfail=10 -n auto --durations=30 test/unit test/backend test/opt --ignore test/backend/test_custom_kernel.py --ignore test/unit/test_hashing.py -k "not test_setitem_big" -k "not test_conv2d_ceildiv_edge_case" --splits 3 --group ${{ matrix.group }}
 
   fuzzing:
     name: Fuzzing
