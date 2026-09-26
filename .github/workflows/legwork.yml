@@ -51,5 +51,6 @@ jobs:
           test/unit/test_llm_placement.py
           test/unit/test_llm_placement_execution.py
           test/unit/test_llm_placement_server.py
+          test/unit/test_llm_placement_qwen.py
           test/unit/test_llm_server.py
           test/null/test_llm_server.py

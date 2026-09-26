@@ -114,9 +114,12 @@ class TestLayerPlacement(unittest.TestCase):
 
   def test_invalid_parameter_names_and_indices(self):
     p = LayerPlacement(('CPU', 'CPU:1'), (2, 2)).validate(4)
-    for name in ('other.weight', 'token_embd.bias', 'blk.0.attn_q.bias', 'blk.0.attn_q_norm.weight',
+    for name in ('other.weight', 'token_embd.bias', 'blk.0.attn_output.bias', 'blk.0.ffn_down.bias', 'blk.0.attn_q_norm.bias',
                  'blk.-1.attn_q.weight', 'blk.00.attn_q.weight', 'blk.4.attn_q.weight', 'blk.1.unknown.weight'):
       with self.subTest(name=name), self.assertRaises(ValueError): p.owner(name)
+    # qwen2 biases and qwen3 Q/K norms have block owners; preflight refuses them outside their family.
+    for name in ('blk.0.attn_q.bias', 'blk.1.attn_v.bias', 'blk.2.attn_q_norm.weight', 'blk.3.attn_k_norm.weight'):
+      with self.subTest(name=name): self.assertEqual(p.owner(name), 'CPU' if int(name.split('.')[1]) < 2 else 'CPU:1')
     for index in (-1, 4, True, 1.0):
       with self.subTest(index=index), self.assertRaises(ValueError): p.block_device(index)
 
@@ -264,7 +267,7 @@ class TestPlacedLoading:
     ts, kv, _ = llama_fixture()
     kv['llama.block_count'] = (10,2**63)
     path, _ = save_llama(tmp_path,tensors=ts,metadata=kv)
-    with no_allocations(), patch.object(model_module,'_llama_parameter_shapes',side_effect=AssertionError('unbounded manifest')), \
+    with no_allocations(), patch.object(model_module,'_dense_parameter_shapes',side_effect=AssertionError('unbounded manifest')), \
          pytest.raises(ValueError,match='tensor count'):
       Transformer.from_gguf(path,placement=LayerPlacement(('CPU',),(2**63,)))
 

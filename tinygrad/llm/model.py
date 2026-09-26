@@ -107,24 +107,35 @@ class TransformerConfig:
   qkv_bias: bool = False
   expert_bias: bool = False
 
-def _llama_parameter_shapes(config:TransformerConfig) -> dict[str, tuple[int, ...]]:
-  d, h, k = config.dim, config.hidden_dim, config.n_kv_heads*config.head_dim
-  block = {'attn_norm':(d,), 'ffn_norm':(d,), 'attn_q':(d,d), 'attn_k':(k,d), 'attn_v':(k,d), 'attn_output':(d,d),
-           'ffn_gate':(h,d), 'ffn_up':(h,d), 'ffn_down':(d,h)}
+_PLACED_ARCHITECTURES = ('llama', 'qwen2', 'qwen3')
+
+def _block_parameter_shapes(config:TransformerConfig) -> dict[str, tuple[int, ...]]:
+  d, h, q, k = config.dim, config.hidden_dim, config.n_heads*config.head_dim, config.n_kv_heads*config.head_dim
+  # Weights before biases: shape-only construction attaches each bias to its already-built Linear.
+  block = {'attn_norm.weight':(d,), 'ffn_norm.weight':(d,), 'attn_q.weight':(q,d), 'attn_k.weight':(k,d), 'attn_v.weight':(k,d),
+           'attn_output.weight':(d,q), 'ffn_gate.weight':(h,d), 'ffn_up.weight':(h,d), 'ffn_down.weight':(d,h)}
+  if config.qk_norm: block |= {'attn_q_norm.weight':(config.qk_norm,), 'attn_k_norm.weight':(config.qk_norm,)}
+  if config.qkv_bias: block |= {'attn_q.bias':(q,), 'attn_k.bias':(k,), 'attn_v.bias':(k,)}
+  return block
+
+def _dense_parameter_shapes(config:TransformerConfig) -> dict[str, tuple[int, ...]]:
+  d, block = config.dim, _block_parameter_shapes(config)
   return {'token_embd.weight':(config.vocab_size,d), 'output_norm.weight':(d,), 'output.weight':(config.vocab_size,d),
-          **{f'blk.{i}.{name}.weight':shape for i in range(config.num_blocks) for name,shape in block.items()}}
+          **{f'blk.{i}.{name}':shape for i in range(config.num_blocks) for name,shape in block.items()}}
 
 
 def preflight_placement(index:GGUFIndex, placement:LayerPlacement, *, max_context:int|None=None,
                         realize:bool=False) -> tuple[TransformerConfig, LayerPlacement]:
-  """Validate the entire dense-Llama configuration/manifest without Tensors, payload reads or device opening.
+  """Validate the entire dense llama, qwen2 or qwen3 configuration/manifest without Tensors, payload reads or device opening.
 
   Consumes the checked local-path index. Returns config with effective context and canonical placement, suitable
-  for metadata-only accounting. Unknown Llama computation fields fail closed; descriptive/tokenizer metadata is retained.
+  for metadata-only accounting. Unknown computation fields fail closed; descriptive/tokenizer metadata is retained.
+  Each family is exact: qwen2 requires Q/K/V biases, qwen3 requires per-head Q/K RMSNorm, llama has neither.
   """
   if realize: raise ValueError('explicit placement requires REALIZE=0')
   kv = index.kv
-  if kv.get('general.architecture') != 'llama': raise ValueError('explicit placement supports only dense llama')
+  if (arch := kv.get('general.architecture')) not in _PLACED_ARCHITECTURES:
+    raise ValueError('explicit placement supports only dense llama, qwen2 and qwen3')
   # Omitted by some legacy writers. Explicit versions must describe the layouts decoded here (GGML_QUANT_VERSION=2).
   if 'general.quantization_version' in kv and (type(kv['general.quantization_version']) is not int or kv['general.quantization_version'] != 2):
     raise ValueError('unsupported GGUF quantization version for placement')
@@ -134,14 +145,16 @@ def preflight_placement(index:GGUFIndex, placement:LayerPlacement, *, max_contex
   def positive_float(key:str) -> float:
     if type(v := kv.get(key, 0)) not in (int, float) or not math.isfinite(v) or v <= 0: raise ValueError(f'{key} must be finite and positive')
     return float(v)
-  placement = placement.validate(blocks := positive_int('llama.block_count'))
-  dim, hidden, heads = (positive_int(f'llama.{key}') for key in ('embedding_length', 'feed_forward_length', 'attention.head_count'))
-  kv_heads = positive_int('llama.attention.head_count_kv', heads)
-  head_dim = positive_int('llama.attention.key_length', dim//heads)
-  rope_dim, value_dim = (positive_int(f'llama.{key}', head_dim) for key in ('rope.dimension_count', 'attention.value_length'))
-  if dim != heads*head_dim or head_dim != rope_dim or head_dim != value_dim or rope_dim % 2 or heads % kv_heads:
-    raise ValueError('placement requires full even-head RoPE, dim=heads*head_dim, equal Q/K/V head dimensions and divisible GQA')
-  context = positive_int('llama.context_length')
+  placement = placement.validate(blocks := positive_int(f'{arch}.block_count'))
+  dim, hidden, heads = (positive_int(f'{arch}.{key}') for key in ('embedding_length', 'feed_forward_length', 'attention.head_count'))
+  kv_heads = positive_int(f'{arch}.attention.head_count_kv', heads)
+  head_dim = positive_int(f'{arch}.attention.key_length', dim//heads)
+  rope_dim, value_dim = (positive_int(f'{arch}.{key}', head_dim) for key in ('rope.dimension_count', 'attention.value_length'))
+  # qwen3 declares its head width, and its query width may differ from dim (Qwen3-0.6B, Qwen3-4B).
+  if (arch != 'qwen3' and dim != heads*head_dim) or head_dim != rope_dim or head_dim != value_dim or rope_dim % 2 or heads % kv_heads:
+    raise ValueError('placement requires full even-head RoPE, dim=heads*head_dim outside qwen3, equal Q/K/V head dimensions '
+                     'and divisible GQA')
+  context = positive_int(f'{arch}.context_length')
   if max_context is not None:
     if type(max_context) is not int or max_context <= 0: raise ValueError('max_context must be a positive integer')
     context = min(context, max_context)
@@ -149,7 +162,7 @@ def preflight_placement(index:GGUFIndex, placement:LayerPlacement, *, max_contex
   tokens = kv.get('tokenizer.ggml.tokens')
   if not isinstance(tokens, list) or not tokens or any(not isinstance(t, str) for t in tokens):
     raise ValueError('tokenizer.ggml.tokens must be a nonempty string array')
-  if positive_int('llama.vocab_size', len(tokens)) != len(tokens): raise ValueError('vocabulary size disagrees with tokenizer')
+  if positive_int(f'{arch}.vocab_size', len(tokens)) != len(tokens): raise ValueError('vocabulary size disagrees with tokenizer')
 
   # Reference dense computation only. Neutral settings are allowed explicitly, never through truthiness/coercion.
   neutral = {'rope.scaling.type':'none', 'rope.scaling.factor':1.0, 'rope.scale_linear':1.0, 'rope.scaling.finetuned':False,
@@ -159,18 +172,20 @@ def preflight_placement(index:GGUFIndex, placement:LayerPlacement, *, max_contex
                'attention.head_count', 'attention.head_count_kv', 'attention.key_length', 'attention.value_length',
                'attention.layer_norm_rms_epsilon', 'rope.dimension_count', 'rope.freq_base'}
   for key,value in kv.items():
-    if key in ('general.tensor_data_layout', 'llama.tensor_data_layout') and value != 'reference':
+    if key in ('general.tensor_data_layout', f'{arch}.tensor_data_layout') and value != 'reference':
       raise ValueError(f'unsupported placement metadata: {key}')
-    if not key.startswith('llama.') or (field := key[len('llama.'):]) in supported: continue
+    if not key.startswith(f'{arch}.') or (field := key[len(arch)+1:]) in supported: continue
     if field not in neutral: raise ValueError(f'unsupported placement computation metadata: {key}')
     expected = neutral[field]
     if (type(value) is not type(expected) and not (type(expected) is float and type(value) is int)) or value != expected:
       raise ValueError(f'unsupported placement metadata value: {key}')
-  config = TransformerConfig(blocks, dim, hidden, heads, kv_heads, positive_float('llama.attention.layer_norm_rms_epsilon'), len(tokens),
-                             head_dim, positive_float('llama.rope.freq_base'), rope_dim, value_dim, max_context=context)
+  config = TransformerConfig(blocks, dim, hidden, heads, kv_heads, positive_float(f'{arch}.attention.layer_norm_rms_epsilon'), len(tokens),
+                             head_dim, positive_float(f'{arch}.rope.freq_base'), rope_dim, value_dim, max_context=context,
+                             qk_norm=head_dim if arch == 'qwen3' else 0, qkv_bias=arch == 'qwen2')
   # Bound manifest expansion by the already bounded descriptor inventory, not a potentially enormous metadata count.
-  if not 2 + 9*blocks <= len(index.tensors) <= 4 + 9*blocks: raise ValueError('placed tensor count disagrees with block count')
-  shapes, names = _llama_parameter_shapes(config), set()
+  per_block = len(_block_parameter_shapes(config))
+  if not 2 + per_block*blocks <= len(index.tensors) <= 4 + per_block*blocks: raise ValueError('placed tensor count disagrees with block count')
+  shapes, names = _dense_parameter_shapes(config), set()
   for info in index.tensors:
     if info.name in names: raise ValueError(f'duplicate placed tensor: {info.name}')
     names.add(info.name)
@@ -452,12 +467,16 @@ class GatedDeltaNetBlock(FFNBlock):
       self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device).clone()
 
-def _shape_only_llama(config:TransformerConfig) -> tuple[list[FFNBlock], nn.Embedding, nn.RMSNorm, Linear]:
+def _shape_only_dense(config:TransformerConfig) -> tuple[list[FFNBlock], nn.Embedding, nn.RMSNorm, Linear]:
   # Bypass random Linear/Embedding initializers, which allocate RNG storage even without weight realization.
   blocks:list[FFNBlock] = [TransformerBlock.__new__(TransformerBlock) for _ in range(config.num_blocks)]
   for block in blocks: block.config = config
   endpoints = {}
-  for name,shape in _llama_parameter_shapes(config).items():
+  for name,shape in _dense_parameter_shapes(config).items():
+    if name.endswith('.bias'):
+      _, index, component, _ = name.split('.')
+      getattr(blocks[int(index)], component).bias = Tensor.empty(*shape, device='PYTHON')
+      continue
     layer:nn.RMSNorm|nn.Embedding|Linear
     if len(shape) == 1: layer = nn.RMSNorm(shape[0], config.norm_eps, elementwise_affine=False)
     elif name == 'token_embd.weight': layer = nn.Embedding.__new__(nn.Embedding)
@@ -534,7 +553,7 @@ class Transformer:
 
   def __init__(self, config:TransformerConfig, *, _shape_only:bool=False):
     self.blk:list[FFNBlock]
-    if _shape_only: self.blk, self.token_embd, self.output_norm, self.output = _shape_only_llama(config)
+    if _shape_only: self.blk, self.token_embd, self.output_norm, self.output = _shape_only_dense(config)
     else:
       dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0,
                              hidden_dim=config.dense_hidden_dim or config.hidden_dim)
@@ -656,14 +675,15 @@ class Transformer:
       # Check construction against the complete validated manifest before the very first payload transfer.
       if parameters.keys() != {name for name,_,_ in manifest} or any(parameters[n].shape != info.shape for n,info,_ in manifest):
         raise ValueError('placed model construction disagrees with GGUF manifest')
-      model.placement = placement
+      model.placement, llama = placement, index.kv['general.architecture'] == 'llama'
       loaded:dict[tuple[int, int, int, str], Tensor] = {}
       for name,info,owner in manifest:
         if (key := (info.part, info.offset, info.nbytes, owner)) not in loaded:
           weight = load_gguf_tensor(index, info, device=owner)
           if getenv('HALF', 1): weight = weight.half()
           # Full-head Llama RoPE: interleaved rows to half-split, matching the legacy Q/K transforms below.
-          if name.endswith(('attn_q.weight', 'attn_k.weight')):
+          # qwen2/qwen3 rows are already half-split (NEOX), which legacy loading also leaves unpermuted.
+          if llama and name.endswith(('attn_q.weight', 'attn_k.weight')):
             heads = config.n_heads if name.endswith('attn_q.weight') else config.n_kv_heads
             weight = weight.reshape(heads, config.head_dim, config.dim).rearrange('n (h two) d -> n (two h) d', two=2).reshape(info.shape)
           loaded[key] = weight

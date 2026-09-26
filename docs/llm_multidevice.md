@@ -52,20 +52,29 @@ per placed model, without modifying legacy models' settings.
 ## Supported model envelope
 
 Only little-endian GGUF v2/v3, including validated multipart local files, with
-`general.architecture=llama` and ordinary dense full-context attention. Batch one.
-Full-head RoPE requires equal even Q/K/V/RoPE head dimensions,
-`dim = heads * head_dim`, and valid GQA divisibility. Missing KV-head count defaults
-to query heads. Effective context is capped by metadata as in legacy loading.
+ordinary dense full-context attention. Batch one. Three architectures, each exact:
+
+- `general.architecture=llama`: no attention biases or Q/K normalization.
+- `qwen2`: Q/K/V biases on every block (Qwen2 and Qwen2.5 dense models).
+- `qwen3`: per-head Q/K RMSNorm on every block (Qwen3 dense models).
+
+Full-head RoPE requires equal even Q/K/V/RoPE head dimensions and valid GQA
+divisibility. `dim = heads * head_dim` is required outside `qwen3`, whose declared
+head width may make the query projection wider than `dim`. Missing KV-head count
+defaults to query heads. Effective context is capped by metadata as in legacy loading.
+Llama Q/K rows are permuted to half-split RoPE as in legacy loading; qwen rows are
+already half-split and load unchanged.
 
 Supported weight types: F32, F16, BF16, Q4_0, Q8_0, Q4_K, Q5_K and Q6_K. An omitted
 `general.quantization_version` is accepted for compatibility; an explicit value
 must be integer 2. Unknown versions, formats, shapes and computation-changing
 metadata fail before model construction or payload copying.
 
-No MoE, MLA, recurrent layers, QKV biases, Q/K normalization, sliding windows,
+No MoE (`qwen2moe`, `qwen3moe`, `qwen35moe`), hybrid or recurrent layers (`qwen35`),
+MLA, biases or Q/K normalization outside their family, sliding windows,
 attention gates/clamping/ALiBi, parallel residual, predictor layers, non-reference
-layout, or nontrivial RoPE scaling. This excludes many otherwise valid GGUF models.
-Legacy mode retains its architectures; placement never silently falls back to it.
+layout, or nontrivial RoPE scaling (YaRN included). This excludes many otherwise valid
+GGUF models. Legacy mode retains its architectures; placement never silently falls back to it.
 
 Files are read-only and must remain trusted and unchanged during loading.
 Bounds, alignment, split indices/counts, repeated metadata, names/shapes/types and
@@ -156,5 +165,6 @@ DEV=CPU BEAM=0 python -m pytest -x -q -n auto \
   test/unit/test_gguf_placement.py \
   test/unit/test_llm_placement.py \
   test/unit/test_llm_placement_execution.py \
-  test/unit/test_llm_placement_server.py
+  test/unit/test_llm_placement_server.py \
+  test/unit/test_llm_placement_qwen.py
 ```

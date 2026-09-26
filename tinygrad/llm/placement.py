@@ -8,7 +8,10 @@ if TYPE_CHECKING:
   from tinygrad.llm.gguf import GGUFIndex, GGUFTensorInfo
   from tinygrad.llm.model import TransformerConfig
 
-_BLOCK_WEIGHTS = ('attn_norm', 'attn_q', 'attn_k', 'attn_v', 'attn_output', 'ffn_norm', 'ffn_gate', 'ffn_up', 'ffn_down')
+# The union over the placed families; preflight admits only the subset a model's architecture defines.
+_BLOCK_WEIGHTS = ('attn_norm', 'attn_q', 'attn_k', 'attn_v', 'attn_output', 'ffn_norm', 'ffn_gate', 'ffn_up', 'ffn_down',
+                  'attn_q_norm', 'attn_k_norm')
+_BLOCK_BIASES = ('attn_q', 'attn_k', 'attn_v')
 
 @dataclass(frozen=True)
 class LayerPlacement:
@@ -42,7 +45,8 @@ class LayerPlacement:
   def owner(self, parameter_name:str) -> str:
     if parameter_name == 'token_embd.weight': return self.devices[0]
     if parameter_name in ('output_norm.weight', 'output.weight'): return self.devices[-1]
-    if (m := re.fullmatch(r'blk\.(0|[1-9][0-9]*)\.([a-z_]+)\.weight', parameter_name)) and m[2] in _BLOCK_WEIGHTS:
+    if (m := re.fullmatch(r'blk\.(0|[1-9][0-9]*)\.([a-z_]+)\.(weight|bias)', parameter_name)) and \
+       m[2] in (_BLOCK_WEIGHTS if m[3] == 'weight' else _BLOCK_BIASES):
       return self.block_device(int(m[1]))
     raise ValueError(f'unsupported placed parameter: {parameter_name}')
 
