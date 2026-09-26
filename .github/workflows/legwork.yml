@@ -1,0 +1,51 @@
+# The Legwork build of tinygrad (deacix/legwork ADR-23683). This branch is the
+# v0.14.0 tag plus a narrow delta: the tinygrad.llm.kernels package entry and the
+# tinygrad.llm layer placement. The gate holds the runtime, the engine and
+# tensor.py byte-equal to the tag, so every Legwork launcher seam written against
+# 0.14.0 stays valid, and runs the llm suites on CPU.
+name: Legwork build
+
+on:
+  push:
+    branches:
+      - legwork/**
+  pull_request:
+    branches:
+      - legwork/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: legwork-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gate:
+    name: runtime equals v0.14.0; llm suites on CPU
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install -e '.[testing_unit]' pytest-xdist ruff
+      - name: Runtime, engine and tensor.py equal v0.14.0
+        run: git diff --stat --exit-code v0.14.0 -- tinygrad/runtime tinygrad/engine tinygrad/tensor.py
+      - name: Ruff on tinygrad/llm
+        run: python -m ruff check tinygrad/llm
+      - name: llm suites on CPU
+        env:
+          DEV: CPU
+          BEAM: '0'
+        run: >-
+          python -m pytest -q -n auto
+          test/unit/test_gguf.py
+          test/unit/test_llm_server.py
+          test/null/test_llm_server.py

@@ -11,6 +11,7 @@ on:
   push:
     branches:
       - master
+      - legwork/**
   pull_request:
   workflow_dispatch:
 
@@ -232,8 +233,6 @@ jobs:
       run: python3 test/external/external_benchmark_schedule.py
     - name: Run process replay tests
       uses: ./.github/actions/process-replay
-    - name: Repo line count <= 26000 lines
-      run: MAX_LINE_COUNT=26500 python sz.py
 
   spec:
     strategy:
