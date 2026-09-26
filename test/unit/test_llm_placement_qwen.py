@@ -3,6 +3,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 from tinygrad import Tensor, dtypes
+from tinygrad.helpers import Context
 from tinygrad.llm import model as mm
 from tinygrad.llm.gguf import index_gguf
 from tinygrad.llm.model import Transformer
@@ -54,8 +55,9 @@ def save_qwen(tmp_path, arch, *, tensors=None, metadata=None, **kwargs):
 
 def load(path, half, placement=None):
   with patch.object(mm,'getenv',return_value=half):
-    if placement is None: return Transformer.from_gguf(path,32,False)[0]
-    return Transformer.from_gguf(path,32,False,placement=placement)[0]
+    if placement is not None: return Transformer.from_gguf(path,32,False,placement=placement)[0]
+    # The legacy loader uses the default device; the reference must be on CPU whatever DEV the suite runs under.
+    with Context(DEV='CPU'): return Transformer.from_gguf(path,32,False)[0]
 
 
 def refused(path, match):
