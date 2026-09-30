@@ -19,6 +19,7 @@ reference matching the task:
 | Tokenization, templates, SSE, reasoning and tool calls | [Protocol compatibility](references/protocol.md) |
 | Runnable checks, test costs and hardware boundaries | [Safe validation](references/validation.md) |
 | Evidence, primary sources, rejected import and maintenance | [Provenance](references/sources.md) |
+| Multimodal image input, vision encoders, multidevice placement | [Multimodal and placement](references/multimodal-placement.md) |
 
 ## 1. Establish the failing boundary
 
@@ -31,6 +32,11 @@ Inspect the current code and the actual test assertions, not just test names:
 - `tinygrad/llm/serve.py`: `StreamRouter`, tool normalization, response assembly;
   SSE framing is inherited from `tinygrad/viz/serve.py::HTTPRequestHandler.stream_json`.
 - `tinygrad/llm/kernels/amd.py`: capability checks and custom-versus-generic paths.
+- `tinygrad/llm/multimodal.py`: `ImageLimits`, `PreparedPrompt`, `prepare_prompt`,
+  `image_positions`, `embed_prompt`; image-token, span and position invariants.
+- `tinygrad/llm/vision.py`: `VisionConfig`, `QwenVision`, the vision blocks and merger.
+- `tinygrad/llm/placement.py`: `LayerPlacement.validate/owner/block_device`,
+  `_placement_manifest`, `estimate_placement` (metadata accounting only).
 
 Record revision, architecture/config, tensor shapes/dtypes, explicit device and
 renderer, seed, prompt IDs, chunk size, start position, cache history, JIT phase,

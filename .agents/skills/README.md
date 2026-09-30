@@ -1,6 +1,8 @@
 # Repository-local agent skills
 
-Reviewed on 2026-09-19 against tinygrad `289656f`. These are coding-agent
+Reviewed on 2026-09-19 against tinygrad `289656f`; extended 2026-09-30 with
+`tinygrad-runtime-driver-development` and `tinygrad-upstream-sync`, reviewed
+against `629fed2`. These are coding-agent
 instructions, not tinygrad runtime features. Cloning this repository installs
 the committed files; no plugin manager, service, credentials or global install
 is needed. `AGENTS.md` is the small routing index. Load only the relevant skill.
@@ -12,7 +14,9 @@ is needed. `AGENTS.md` is the small routing index. Load only the relevant skill.
 | [property-based-testing](property-based-testing/SKILL.md) | Trail of Bits, pinned below | Existing Hypothesis tests cover dtype and graph edge cases. Oracle selection, shrinking and test review complement example tests. Read [local caveats](property-based-testing/NOTICE.md) first. |
 | [tinygrad-rewrite-debugging](tinygrad-rewrite-debugging/SKILL.md) | First-party, MIT | Connects UOps, named passes, SPEC, structural tests and numerical regressions. Includes an isolated VIZ capture and NULL-backend limitations. |
 | [tinygrad-performance-triage](tinygrad-performance-triage/SKILL.md) | First-party, MIT | Separates compilation, dispatch, scheduler and kernel costs; bounds workloads and avoids false speedups from JIT warmup, async execution or instrumentation. |
-| [tinygrad-llm-engine-development](tinygrad-llm-engine-development/SKILL.md) | First-party, MIT | Engine-specific cache/state, attention/MoE, GGUF and protocol invariants; five on-demand references and bounded synthetic checks. Reuses the three skills above. |
+| [tinygrad-llm-engine-development](tinygrad-llm-engine-development/SKILL.md) | First-party, MIT | Engine-specific cache/state, attention/MoE, GGUF and protocol invariants; six on-demand references and bounded synthetic tests. Reuses the three skills above. |
+| [tinygrad-runtime-driver-development](tinygrad-runtime-driver-development/SKILL.md) | First-party, MIT | Backends, autogen binding regeneration, HCQ/MMIO interfaces and user-space drivers; mockgpu/hcqfuzz tiers plus hardware boundaries that keep sandbox work offline. |
+| [tinygrad-upstream-sync](tinygrad-upstream-sync/SKILL.md) | First-party, MIT | Merges upstream tinygrad/tinygrad into the fork: conflict triage map, post-merge ladder (gate, process replay, sz.py) and the agent-skill re-review trigger. |
 
 The first-party skills are original repository-specific workflows, not
 renamed marketplace installs. No suitable off-the-shelf tinygrad-specific skill
@@ -81,6 +85,16 @@ or generic git/PR/plan/review skill was installed. This Legwork run already
 supplies the latter workflows as an ignored platform overlay; they are not
 tracked repository assets and are not dependencies of the new skills.
 
+The 2026-09-30 selection pass additionally rejected, each in one line: a
+docs/mkdocs skill (standard tooling; `docs/developer/*.md` already maps the
+pipeline), a separate benchmark skill (`tinygrad-performance-triage` owns
+bounded measurement), a generic root-cause debugging skill (the recorded
+obra/superpowers rejection stands; tinygrad-specific debugging lives in
+`tinygrad-rewrite-debugging`), and folding driver work into the rewrite skill
+(different failure modes and hardware boundaries; it would break one-skill-
+per-task loading). Generic test-runner and CI-triage skills stay platform
+supplies, never tracked repo assets.
+
 ## Provenance and maintenance
 
 Trail of Bits revision: `123037ec8aed26f0d86327cc39137ee5043e5deb`.
@@ -117,7 +131,7 @@ permissions or plugins:
 opencode debug skill
 ```
 
-Expect the four names above, with locations under this checkout and non-empty
+Expect the six names above, with locations under this checkout and non-empty
 instruction content. Run inside the worktree. Its `skill` tool loads these names
 on demand; no model/provider is required for `debug skill`. If missing, check
 capitalization, directory/name agreement and user/global permission overrides.
@@ -130,12 +144,13 @@ in a disposable Python 3.11+ venv, **not tinygrad's dependencies**. After review
 that source, install its `skills-ref` directory into that venv and run:
 
 ```sh
-for name in property-based-testing tinygrad-rewrite-debugging tinygrad-performance-triage tinygrad-llm-engine-development; do
+for name in property-based-testing tinygrad-rewrite-debugging tinygrad-performance-triage tinygrad-llm-engine-development tinygrad-runtime-driver-development tinygrad-upstream-sync; do
   skills-ref validate ".agents/skills/$name" || exit 1
 done
 skills-ref to-prompt .agents/skills/property-based-testing \
   .agents/skills/tinygrad-rewrite-debugging .agents/skills/tinygrad-performance-triage \
-  .agents/skills/tinygrad-llm-engine-development
+  .agents/skills/tinygrad-llm-engine-development .agents/skills/tinygrad-runtime-driver-development \
+  .agents/skills/tinygrad-upstream-sync
 ```
 
 The reference library needs Click and StrictYAML. This validates metadata and
