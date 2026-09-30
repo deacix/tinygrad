@@ -13,6 +13,7 @@ is needed. `AGENTS.md` is the small routing index. Load only the relevant skill.
 | [tinygrad-rewrite-debugging](tinygrad-rewrite-debugging/SKILL.md) | First-party, MIT | Connects UOps, named passes, SPEC, structural tests and numerical regressions. Includes an isolated VIZ capture and NULL-backend limitations. |
 | [tinygrad-performance-triage](tinygrad-performance-triage/SKILL.md) | First-party, MIT | Separates compilation, dispatch, scheduler and kernel costs; bounds workloads and avoids false speedups from JIT warmup, async execution or instrumentation. |
 | [tinygrad-llm-engine-development](tinygrad-llm-engine-development/SKILL.md) | First-party, MIT | Engine-specific cache/state, attention/MoE, GGUF and protocol invariants; five on-demand references and bounded synthetic checks. Reuses the three skills above. |
+| [tinygrad-runtime-driver-development](tinygrad-runtime-driver-development/SKILL.md) | First-party, MIT | Backends, autogen binding regeneration, HCQ/MMIO interfaces and user-space drivers; mockgpu/hcqfuzz tiers plus hardware boundaries that keep sandbox work offline. |
 
 The first-party skills are original repository-specific workflows, not
 renamed marketplace installs. No suitable off-the-shelf tinygrad-specific skill
