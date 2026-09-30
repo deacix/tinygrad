@@ -19,7 +19,7 @@ hooks or kernel modules. For incorrect values or kernel structure, start with
 | --- | --- |
 | Backends (device, compiler, allocator, program) | `tinygrad/runtime/ops_*.py` (14 today) |
 | Shared runtime plumbing | `tinygrad/runtime/support/` (`hcq.py`, `hcq2.py`, `memory.py`, `elf.py`, `system.py`, `compiler_*`) |
-| Generated C bindings | `tinygrad/runtime/autogen/` (41 modules) plus `support/c.py` ioctl macros |
+| Generated C bindings | `tinygrad/runtime/autogen/` (regenerable modules plus the `am/`, `nv_regs/`, `amd/` subpackages) and `support/c.py` ioctl macros |
 | Graph capture backends | `tinygrad/runtime/graph/` |
 | User-space device drivers | `extra/nv_gpu_driver`, `extra/qcom_gpu_driver`, `extra/hip_gpu_driver`, `extra/bnxt_driver`, `extra/usbgpu`, `extra/amdflash`, `extra/amdpci` |
 | Simulated devices for offline tests | `test/mockgpu/` (NV, AMD, AM, USB mock drivers) |
@@ -48,6 +48,10 @@ ran when reporting.
    ```sh
    DEV=NULL python -m pytest test/null/test_hcq_iface.py test/null/test_elf.py -x -q -n12
    ```
+
+   `test_elf.py` shells out to `clang` in most of its tests; a missing C
+   compiler is an environment gap, not a driver regression (the README's
+   "some paths still compile on CPU" caveat applies).
 
 2. **Simulated devices:** `test/mockgpu/` intercepts file descriptors and
    memoryviews with mock NV/AMD/AM/USB drivers selected through DEV interface

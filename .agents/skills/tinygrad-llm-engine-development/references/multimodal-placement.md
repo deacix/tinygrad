@@ -70,4 +70,7 @@ ragged chunking, divergence and position-zero restart, and compare outputs
 or test-side logits **and** valid state slices (see the execution reference's
 cache-comparison rules). The existing suites under `test/null/`
 (`test_llm_multimodal.py`, `test_llm_server.py`, `test_llm_tokenizer.py`,
-`test_qwen_evaluation.py`, `test_qwen_http.py`) show the current shapes.
+`test_qwen_evaluation.py`, `test_qwen_http.py`) show the current shapes, and
+the placement suites under `test/unit/` (`test_llm_placement.py`,
+`test_llm_placement_execution.py`, `test_llm_placement_server.py`,
+`test_gguf_placement.py`) show the placement ones.

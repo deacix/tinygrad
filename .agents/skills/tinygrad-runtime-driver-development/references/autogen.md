@@ -1,9 +1,11 @@
 # Generated bindings: regenerate, never hand-edit
 
-`tinygrad/runtime/autogen/` holds 41 committed, generated C-binding modules
+`tinygrad/runtime/autogen/` holds the committed, generated C-binding modules
 (`kfd.py`, `cuda.py`, `comgr.py`, `hsa.py`, `nv*.py`, `libc.py`, `io_uring.py`,
 `libusb.py`, `mesa.py`, `bnxt.py`, `mlx5.py`, `llvm*.py`, `ggml_common.py`, the
-`am/` and `nv/` subpackages, and more). They share `# mypy: disable-error-code="empty-body"`
+`am/`, `nv_regs/` and `amd/` subpackages, and more — count them with the
+in-tree Autogen job's own `find` expression, never from memory: 65 files
+regenerate through it today). They share `# mypy: disable-error-code="empty-body"`
 headers and build on the ioctl macros in `tinygrad/runtime/support/c.py`
 (`_IO`, `_IOW`, `_IOR`, `_IOWR`).
 

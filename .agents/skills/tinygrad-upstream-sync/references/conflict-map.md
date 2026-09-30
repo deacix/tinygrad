@@ -17,17 +17,22 @@ addition; re-verify paths after a large upstream restructure.
 | `tinygrad/engine/` (JIT, realize) | `engine/jit.py` | capture-phase behavior | upstream-first; `test/test_tiny.py::TestTiny::test_jit` is the smoke |
 | `tinygrad/renderer/`, `tinygrad/runtime/ops_*.py` | backends | kernel text changes | upstream-first; process replay judges kernel diffs |
 | `tinygrad/runtime/autogen/**`, `runtime/support/autogen.py` | generated bindings | upstream regenerated versions | prefer a local regeneration over a hand merge; the in-tree Autogen CI diff is authoritative |
+| `tinygrad/llm/model.py`, `serve.py`, `cli.py`, `gguf.py`, `kernels/amd.py` | upstream's LLM engine, fork-extended | both sides change these files (UU in real syncs) | upstream-first + fork delta re-applied, exactly like any shared core file; only `multimodal.py`/`vision.py`/`placement.py` are fork-only |
 | `pyproject.toml` | extras (`testing*`, `linting`, `docs`) | dependency pin drift | take upstream's pins unless the fork's tests need a fork pin; say so in the PR |
-| `test/` layout (`backend/`, `null/`, `unit/`) | test groups | files moving between groups | follow upstream's new home; update skill references that name test paths |
+| `.github/workflows/test.yml` | CI matrix | both sides edited (the fork adds mockgpu/LLM jobs) | keep the fork's added jobs atop upstream's restructure |
+| `test/` layout (`backend/`, `null/`, `unit/`) | test groups | files moving between groups; upstream renamed `test/unit/` → `test/runtime/` | follow upstream's new home (the rename relocates the fork's LLM tests under `test/unit/`); update skill references that name test paths |
 
-## Fork-owned (never replaced by upstream)
+## Fork-only (never replaced by upstream)
 
-| Path | Why it is fork-owned |
+| Path | Why it is fork-only |
 | --- | --- |
-| `tinygrad/llm/**` | the fork's LLM engine (model, gguf, serve, multimodal, vision, placement, kernels) — upstream has no equivalent |
-| `.agents/skills/**`, `AGENTS.md`'s skills index | the committed agent skills; upstream merges must not delete their routes |
-| `opencode.json` | fork's agent config |
-| `extra/gptoss_kernels`, fork-added `extra/` entries | fork experiments; confirm they still import after a core merge |
+| `tinygrad/llm/multimodal.py`, `vision.py`, `placement.py` | fork-only modules (Qwen image inference, contiguous layer placement) — upstream has no equivalent |
+| `.agents/skills/**`, the `# Repository skills` block of `AGENTS.md` | the committed agent skills; upstream merges must not delete their routes. (`AGENTS.md` itself is upstream's file — resolve shared, keep the block.) |
+| fork-added LLM tests under `test/unit/` (e.g. `test_llm_placement*.py`, `test_gguf_placement.py`) | follow them into upstream's new `test/runtime/` home on rename conflicts; never drop them |
+
+Files that look fork-only but are **not**: `opencode.json`,
+`extra/gptoss_kernels`, the rest of `AGENTS.md`, and the shared LLM engine
+files above all exist upstream — resolve them like shared core.
 
 ## After the resolution
 

@@ -14,7 +14,7 @@ device state.
 3. **Never copy self-hosted CI's device resets into a sandbox.** Self-hosted
    benchmark and device jobs may reset GPUs, kill device processes or reload
    drivers as part of their runner image; that is runner-orchestration code,
-   not portable development guidance. Do not run `extra/runbook_digitalocean_mi350x.sh`
+   not portable development guidance. Do not run `extra/runbook_digitalocean_mi350x.md`
    or similar runbooks against a development machine.
 4. **Never swap a device claim for an emulation claim.** GPU, tensor-core,
    SQTT/PMC, multi-device and throughput results require matching authorized
