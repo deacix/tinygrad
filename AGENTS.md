@@ -15,5 +15,6 @@ Load only the skill matching the task; these supplement the notes above.
 - [tinygrad-performance-triage](.agents/skills/tinygrad-performance-triage/SKILL.md): separate compile, dispatch, scheduler and kernel costs before optimizing.
 - [tinygrad-llm-engine-development](.agents/skills/tinygrad-llm-engine-development/SKILL.md): develop LLM prefill/decode and cache semantics, attention/MoE, GGUF loading, tokenization and serving compatibility with bounded synthetic tests.
 - [tinygrad-runtime-driver-development](.agents/skills/tinygrad-runtime-driver-development/SKILL.md): change runtime backends, generated bindings or user-space drivers, proven with mockgpu/process-replay evidence and hardware boundaries respected.
+- [tinygrad-upstream-sync](.agents/skills/tinygrad-upstream-sync/SKILL.md): merge upstream tinygrad into the fork with the conflict map, the post-merge gate and the skill re-review pass.
 
 See [.agents/skills/README.md](.agents/skills/README.md) for sources, installation, verification and exclusions.

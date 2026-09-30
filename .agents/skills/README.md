@@ -14,6 +14,7 @@ is needed. `AGENTS.md` is the small routing index. Load only the relevant skill.
 | [tinygrad-performance-triage](tinygrad-performance-triage/SKILL.md) | First-party, MIT | Separates compilation, dispatch, scheduler and kernel costs; bounds workloads and avoids false speedups from JIT warmup, async execution or instrumentation. |
 | [tinygrad-llm-engine-development](tinygrad-llm-engine-development/SKILL.md) | First-party, MIT | Engine-specific cache/state, attention/MoE, GGUF and protocol invariants; five on-demand references and bounded synthetic checks. Reuses the three skills above. |
 | [tinygrad-runtime-driver-development](tinygrad-runtime-driver-development/SKILL.md) | First-party, MIT | Backends, autogen binding regeneration, HCQ/MMIO interfaces and user-space drivers; mockgpu/hcqfuzz tiers plus hardware boundaries that keep sandbox work offline. |
+| [tinygrad-upstream-sync](tinygrad-upstream-sync/SKILL.md) | First-party, MIT | Merges upstream tinygrad/tinygrad into the fork: conflict triage map, post-merge ladder (gate, process replay, sz.py) and the agent-skill re-review trigger. |
 
 The first-party skills are original repository-specific workflows, not
 renamed marketplace installs. No suitable off-the-shelf tinygrad-specific skill
